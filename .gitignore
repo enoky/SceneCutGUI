@@ -181,5 +181,5 @@ cython_debug/
 .cursorindexingignore
 
 # Custom Exclusions
-.weights/
+/weights
 config.json
