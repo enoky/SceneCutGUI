@@ -319,6 +319,7 @@ class SceneDetectApp:
         ai_spin = ttk.Spinbox(ai_frame, from_=2, to=10, textvariable=self.ai_window_var, width=5)
         ai_spin.grid(row=1, column=1, padx=5, pady=5, sticky="w")
         self._attach_tooltip(ai_spin, "ai_window")
+        
         ttk.Label(ai_frame, text="Flash Sensitivity:").grid(row=1, column=2, padx=(20, 5), pady=5, sticky="w")
         flash_spin = ttk.Spinbox(ai_frame, from_=15, to=80, textvariable=self.flash_sensitivity_var, width=5)
         flash_spin.grid(row=1, column=3, padx=5, pady=5, sticky="w")
@@ -658,7 +659,7 @@ class SceneDetectApp:
 
                 # Cheap cues
                 FLASH_LUMA_DELTA = 30.0  # Lower default for better flash detection
-                FLASH_HIGH_LUMA = 200.0  # White-flash detection threshold
+                FLASH_HIGH_LUMA = 180.0  # White-flash detection threshold
                 NEAR_BLACK_LUMA = 18.0
 
                 # Adjacent-frame continuity gating
@@ -957,31 +958,51 @@ class SceneDetectApp:
                     post_motion = self._avg_adjacent_similarity(post_vecs_s)
                     motion_score = float(max(0.0, 1.0 - 0.5 * (pre_motion + post_motion)))
 
-                    # Luma gating cues - enhanced with multi-frame and white-flash detection
-                    luma_pre = self.luma_cache.get(pre_adj)
-                    luma_post = self.luma_cache.get(post_adj)
+                    # Luma gating cues - Return-to-Baseline Flash Detection
+                    luma_prev = self.luma_cache.get(pre_adj)     # cut - 1
+                    luma_curr = self.luma_cache.get(post_adj)    # cut
+                    luma_next = self.luma_cache.get(post_adj + 1) # cut + 1
+                    
                     flash = False
                     near_black = False
                     
-                    if luma_pre is not None and luma_post is not None:
-                        # Basic single-frame luma delta check (using configurable threshold)
-                        flash = abs(luma_pre - luma_post) >= self.flash_luma_delta
-                        near_black = (luma_pre <= self.NEAR_BLACK_LUMA) or (luma_post <= self.NEAR_BLACK_LUMA)
+                    if luma_prev is not None and luma_curr is not None:
+                        # 1. Dark scene check
+                        near_black = (luma_prev <= self.NEAR_BLACK_LUMA) or (luma_curr <= self.NEAR_BLACK_LUMA)
                         
-                        # White-flash detection: one frame is very bright while the other isn't
+                        # 2. White Flash Check (High Abs Luma)
                         is_white_flash = (
-                            (luma_pre > self.FLASH_HIGH_LUMA) != (luma_post > self.FLASH_HIGH_LUMA)
+                            (luma_prev > self.FLASH_HIGH_LUMA) != (luma_curr > self.FLASH_HIGH_LUMA)
                         )
-                        flash = flash or is_white_flash
-                    
-                    # Multi-frame flash detection: check luma spike within a ±2 frame window
-                    if not flash:
-                        flash_window_frames = [cut_frame - 2, cut_frame - 1, cut_frame, cut_frame + 1]
-                        lumas = [self.luma_cache.get(f) for f in flash_window_frames if f in self.luma_cache]
-                        if len(lumas) >= 3:
-                            luma_range = max(lumas) - min(lumas)
-                            if luma_range >= self.flash_luma_delta:
-                                flash = True
+                        
+                        # 3. Spike / Return-to-Baseline Check
+                        # We need luma_next to verify it's a spike, not a step.
+                        is_luma_spike = False
+                        if luma_next is not None:
+                            delta_rise = abs(luma_curr - luma_prev)
+                            delta_fall = abs(luma_next - luma_curr)
+                            delta_base = abs(luma_next - luma_prev)
+                            
+                            # It is a flash if:
+                            # A. The initial jump is significant (> threshold)
+                            # B. The 'return' jump is also significant
+                            # C. The baseline difference (prev vs next) is relatively small compared to the jump
+                            
+                            if delta_rise >= self.flash_luma_delta:
+                                # Check if it returns to similar level
+                                # "Stepped" change (cut) would have small delta_fall and large delta_base
+                                # "Spike" (flash) has large delta_fall and small delta_base
+                                
+                                # Heuristic: The fall must be at least 50% of the rise (or vice versa)
+                                # AND the baseline difference must be smaller than the jump.
+                                if delta_fall >= (delta_rise * 0.5):
+                                     is_luma_spike = True
+                        else:
+                            # Fallback if we are at the very last frame (cannot check next)
+                            # Just use simple delta
+                            is_luma_spike = abs(luma_curr - luma_prev) >= self.flash_luma_delta
+                            
+                        flash = is_white_flash or is_luma_spike
 
                     return {
                         "s_small": float(s_small),
@@ -1012,14 +1033,30 @@ class SceneDetectApp:
                     thr = float(base_thr + self.MOTION_BOOST * motion + (self.BLACK_BOOST if near_black else 0.0))
                     thr = float(min(max(thr, 0.80), 0.97))
 
+                    # Safety Floor: Visual similarity must be at least 0.45 to merge
+                    safety_floor = 0.45
+
+                    if s_comb < safety_floor:
+                         decision_keep = True
+                         reason = "safety_floor_violation"
                     # Strong adjacent discontinuity almost always means a true cut.
-                    if s_adj is not None and s_adj < self.ADJ_KEEP_CUTOFF:
-                        decision_keep = True
-                        reason = "adj_discontinuity"
+                    elif s_adj is not None and s_adj < self.ADJ_KEEP_CUTOFF:
+                        # Strong adjacent discontinuity almost always means a true cut.
+                        # Exception: Massive White Flash (which destroys embeddings)
+                        # We don't have flash_score anymore, but 'flash' is now more robust.
+                        # If it's a "Return to Baseline" flash, s_adj might be low because of the single flash frame.
+                        # But s_comb (surrounding window) should be high.
+                        
+                        # If flash is detected AND global similarity is high, we Override the Adjacency check.
+                        if flash and s_comb >= (thr - 0.05):
+                             decision_keep = False
+                             reason = "flash_override_adj"
+                        else:
+                            decision_keep = True
+                            reason = "adj_discontinuity"
                     else:
-                        # Flash-like spike + reasonably high similarity => likely false positive.
-                        # More aggressive flash gating: removed s_adj requirement for easier triggering
-                        if flash and s_comb >= (thr - 0.02):
+                        # Flash-like spike + high similarity => likely false positive.
+                        if flash and s_comb >= (thr - 0.10): # Relaxed threshold heavily for confirmed flashes
                             decision_keep = False
                             reason = "flash_gate"
                         else:
@@ -1089,6 +1126,8 @@ class SceneDetectApp:
                         # Adjacent frames at boundary
                         all_indices.add(max(0, cut - 1))
                         all_indices.add(min(self.total_video_frames - 1, cut))
+                        # Additional frame for "Return to Baseline" flash check (cut + 1)
+                        all_indices.add(min(self.total_video_frames - 1, cut + 1))
 
                         # Small window (gapped)
                         pre_s, post_s = self._window_indices(cut, w_small, gap, self.total_video_frames)
