@@ -213,7 +213,7 @@ class SceneDetectApp:
         self.detector_type_var = tk.StringVar(value="TransNetV2")
         self.params_vars: dict = {}
         self.ai_validate_var = tk.BooleanVar(value=False)
-        self.ai_window_var = tk.IntVar(value=3)
+        self.ai_window_var = tk.IntVar(value=5)
 
         # --- Output Action Variables ---
         self.export_csv_var = tk.BooleanVar(value=False)
