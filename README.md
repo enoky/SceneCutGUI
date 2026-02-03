@@ -24,12 +24,6 @@ A modern, GPU-accelerated scene detection and video slicing tool with an intuiti
 
 ---
 
-## 📸 Screenshot
-
-![screenshot](assets/screenshot.jpg)
-
----
-
 ## 🛠 Requirements
 
 - **Python 3.10+**

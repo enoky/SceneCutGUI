@@ -214,6 +214,7 @@ class SceneDetectApp:
         self.params_vars: dict = {}
         self.ai_validate_var = tk.BooleanVar(value=False)
         self.ai_window_var = tk.IntVar(value=5)
+        self.flash_sensitivity_var = tk.IntVar(value=30)  # Luma delta threshold for flash detection
 
         # --- Output Action Variables ---
         self.export_csv_var = tk.BooleanVar(value=False)
@@ -318,6 +319,10 @@ class SceneDetectApp:
         ai_spin = ttk.Spinbox(ai_frame, from_=2, to=10, textvariable=self.ai_window_var, width=5)
         ai_spin.grid(row=1, column=1, padx=5, pady=5, sticky="w")
         self._attach_tooltip(ai_spin, "ai_window")
+        ttk.Label(ai_frame, text="Flash Sensitivity:").grid(row=1, column=2, padx=(20, 5), pady=5, sticky="w")
+        flash_spin = ttk.Spinbox(ai_frame, from_=15, to=80, textvariable=self.flash_sensitivity_var, width=5)
+        flash_spin.grid(row=1, column=3, padx=5, pady=5, sticky="w")
+        self._attach_tooltip(flash_spin, "flash_sensitivity")
 
         # --- Output Actions Frame ---
         output_frame = ttk.LabelFrame(main_frame, text="3. Output Actions")
@@ -371,6 +376,7 @@ class SceneDetectApp:
             "detector_params": {key: var.get() for key, var in self.params_vars.items()},
             "ai_validate": self.ai_validate_var.get(),
             "ai_window": self.ai_window_var.get(),
+            "flash_sensitivity": self.flash_sensitivity_var.get(),
             "export_csv": self.export_csv_var.get(),
             "export_html": self.export_html_var.get(),
             "export_sc": self.export_sc_var.get(),
@@ -402,6 +408,7 @@ class SceneDetectApp:
             
             self.ai_validate_var.set(settings.get("ai_validate", False))
             self.ai_window_var.set(settings.get("ai_window", 3))
+            self.flash_sensitivity_var.set(settings.get("flash_sensitivity", 30))
             self.export_csv_var.set(settings.get("export_csv", False))
             self.export_html_var.set(settings.get("export_html", False))
             self.export_sc_var.set(settings.get("export_sc", False))
@@ -650,7 +657,8 @@ class SceneDetectApp:
                 MERGE_MARGIN = 0.01
 
                 # Cheap cues
-                FLASH_LUMA_DELTA = 50.0
+                FLASH_LUMA_DELTA = 30.0  # Lower default for better flash detection
+                FLASH_HIGH_LUMA = 200.0  # White-flash detection threshold
                 NEAR_BLACK_LUMA = 18.0
 
                 # Adjacent-frame continuity gating
@@ -667,7 +675,7 @@ class SceneDetectApp:
                 BOLD = "\033[1m"
                 RESET = "\033[0m"
 
-                def __init__(self, model_dir: str = "./weights", device=None, batch_size: int = 48, logger=None):
+                def __init__(self, model_dir: str = "./weights", device=None, batch_size: int = 48, flash_luma_delta: float = 30.0, logger=None):
                     import os
                     import logging
                     import torch
@@ -691,6 +699,9 @@ class SceneDetectApp:
                     self.luma_cache = {}    # frame_idx -> float luma mean (0-255)
                     self.batch_size = int(batch_size)
                     self.total_video_frames = 0
+                    
+                    # Configurable flash sensitivity (luma delta threshold)
+                    self.flash_luma_delta = float(flash_luma_delta)
 
                     # Precompute normalization tensors
                     self._mean = torch.tensor(self.processor.image_mean, device=self.device).view(1, 3, 1, 1)
@@ -946,14 +957,31 @@ class SceneDetectApp:
                     post_motion = self._avg_adjacent_similarity(post_vecs_s)
                     motion_score = float(max(0.0, 1.0 - 0.5 * (pre_motion + post_motion)))
 
-                    # Luma gating cues
+                    # Luma gating cues - enhanced with multi-frame and white-flash detection
                     luma_pre = self.luma_cache.get(pre_adj)
                     luma_post = self.luma_cache.get(post_adj)
                     flash = False
                     near_black = False
+                    
                     if luma_pre is not None and luma_post is not None:
-                        flash = abs(luma_pre - luma_post) >= self.FLASH_LUMA_DELTA
+                        # Basic single-frame luma delta check (using configurable threshold)
+                        flash = abs(luma_pre - luma_post) >= self.flash_luma_delta
                         near_black = (luma_pre <= self.NEAR_BLACK_LUMA) or (luma_post <= self.NEAR_BLACK_LUMA)
+                        
+                        # White-flash detection: one frame is very bright while the other isn't
+                        is_white_flash = (
+                            (luma_pre > self.FLASH_HIGH_LUMA) != (luma_post > self.FLASH_HIGH_LUMA)
+                        )
+                        flash = flash or is_white_flash
+                    
+                    # Multi-frame flash detection: check luma spike within a ±2 frame window
+                    if not flash:
+                        flash_window_frames = [cut_frame - 2, cut_frame - 1, cut_frame, cut_frame + 1]
+                        lumas = [self.luma_cache.get(f) for f in flash_window_frames if f in self.luma_cache]
+                        if len(lumas) >= 3:
+                            luma_range = max(lumas) - min(lumas)
+                            if luma_range >= self.flash_luma_delta:
+                                flash = True
 
                     return {
                         "s_small": float(s_small),
@@ -989,8 +1017,9 @@ class SceneDetectApp:
                         decision_keep = True
                         reason = "adj_discontinuity"
                     else:
-                        # Flash-like spike + high similarity => likely false positive.
-                        if flash and s_adj is not None and s_adj >= self.ADJ_MERGE_CUTOFF and s_comb >= (thr - 0.005):
+                        # Flash-like spike + reasonably high similarity => likely false positive.
+                        # More aggressive flash gating: removed s_adj requirement for easier triggering
+                        if flash and s_comb >= (thr - 0.02):
                             decision_keep = False
                             reason = "flash_gate"
                         else:
@@ -1129,7 +1158,11 @@ class SceneDetectApp:
                     validated_scenes.append((cur_start, cur_end))
                     return validated_scenes
 
-            validator = DinoCutValidator(model_dir="./weights", batch_size=48)
+            validator = DinoCutValidator(
+                model_dir="./weights",
+                batch_size=48,
+                flash_luma_delta=float(self.flash_sensitivity_var.get())
+            )
 
             def progress_cb(pct: float, msg: str):
                 # Map into the app's overall progress bar range.
