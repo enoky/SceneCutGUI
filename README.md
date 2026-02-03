@@ -78,6 +78,11 @@ pip install -r requirements.txt
 > **Note**: For GPU-accelerated video decoding, install OpenCV with CUDA support from:
 > [opencv-python-cuda-wheels](https://github.com/cudawarped/opencv-python-cuda-wheels/releases)
 
+Install OpenCV with CUDA support command example:
+```bash
+pip install opencv_contrib_python-4.13.0.90-cp37-abi3-win_amd64.whl
+```
+
 ### 4. Download Model Weights
 
 <a href="https://drive.google.com/file/d/1aJ96eJE4DstJ_HBzAusuYLvfU01Jnc92/view?usp=sharing">Download Model Weights</a> and place them in the `weights/` directory:
