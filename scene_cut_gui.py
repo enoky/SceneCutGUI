@@ -185,6 +185,13 @@ def get_video_info(video_path: str) -> tuple[float, int]:
     raise RuntimeError("Could not determine FPS / frame count for the selected video.")
 
 
+def short_scene_guard_frames(fps: float, guard_seconds: float = 0.30) -> int:
+    """Return frame length below which cuts are preserved (default 0.30s)."""
+    if fps <= 0:
+        return 8
+    return max(2, int(round(float(fps) * float(guard_seconds))))
+
+
 def transnetv2_scenes_to_timecodes(
     tn_scenes: list,
     fps: float,
@@ -439,6 +446,9 @@ class SceneDetectApp:
         self.ai_validate_var = tk.BooleanVar(value=False)
         self.ai_window_var = tk.IntVar(value=5)
         self.flash_sensitivity_var = tk.IntVar(value=15)  # Luma delta threshold for flash detection
+        self.refine_pyscenedetect_var = tk.BooleanVar(value=False)
+        self.refine_snap_var = tk.IntVar(value=6)
+        self.refine_threshold_var = tk.DoubleVar(value=27.0)
 
         # --- Output Action Variables ---
         self.export_csv_var = tk.BooleanVar(value=False)
@@ -558,6 +568,25 @@ class SceneDetectApp:
         flash_spin.grid(row=1, column=3, padx=5, pady=5, sticky="w")
         self._attach_tooltip(flash_spin, "flash_sensitivity")
 
+        # --- Refinement Frame ---
+        refine_frame = ttk.LabelFrame(main_frame, text="Optional: PySceneDetect Refinement")
+        refine_frame.pack(fill=tk.X, padx=5, pady=5)
+        refine_check = ttk.Checkbutton(
+            refine_frame,
+            text="Refine cuts with PySceneDetect (ContentDetector)",
+            variable=self.refine_pyscenedetect_var,
+        )
+        refine_check.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="w")
+        self._attach_tooltip(refine_check, "refine_pyscenedetect")
+        ttk.Label(refine_frame, text="Snap Window (frames):").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        refine_snap = ttk.Spinbox(refine_frame, from_=0, to=30, textvariable=self.refine_snap_var, width=5)
+        refine_snap.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        self._attach_tooltip(refine_snap, "refine_snap")
+        ttk.Label(refine_frame, text="Content Threshold:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        refine_thr = ttk.Spinbox(refine_frame, from_=5, to=80, increment=1, textvariable=self.refine_threshold_var, width=5)
+        refine_thr.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        self._attach_tooltip(refine_thr, "refine_threshold")
+
         # --- Output Actions Frame ---
         output_frame = ttk.LabelFrame(main_frame, text="3. Output Actions")
         output_frame.pack(fill=tk.X, padx=5, pady=5, ipady=5)
@@ -625,6 +654,9 @@ class SceneDetectApp:
             "ai_validate": self.ai_validate_var.get(),
             "ai_window": self.ai_window_var.get(),
             "flash_sensitivity": self.flash_sensitivity_var.get(),
+            "refine_pyscenedetect": self.refine_pyscenedetect_var.get(),
+            "refine_snap": self.refine_snap_var.get(),
+            "refine_threshold": self.refine_threshold_var.get(),
             "export_csv": self.export_csv_var.get(),
             "export_html": self.export_html_var.get(),
             "export_sc": self.export_sc_var.get(),
@@ -657,6 +689,9 @@ class SceneDetectApp:
             self.ai_validate_var.set(settings.get("ai_validate", False))
             self.ai_window_var.set(settings.get("ai_window", 3))
             self.flash_sensitivity_var.set(settings.get("flash_sensitivity", 15))
+            self.refine_pyscenedetect_var.set(settings.get("refine_pyscenedetect", False))
+            self.refine_snap_var.set(settings.get("refine_snap", 6))
+            self.refine_threshold_var.set(settings.get("refine_threshold", 27.0))
             self.export_csv_var.set(settings.get("export_csv", False))
             self.export_html_var.set(settings.get("export_html", False))
             self.export_sc_var.set(settings.get("export_sc", False))
@@ -916,13 +951,16 @@ class SceneDetectApp:
             else:
                 raise RuntimeError(f"Unknown detector type: {detector_type}")
 
-            # Enforce minimum scene length (frames)
+            # Enforce minimum scene length (frames), but preserve very short scenes by default.
             min_len = int(detector.get("min_scene_len", 1) or 1)
+            guard_len = short_scene_guard_frames(fps)
             if min_len > 1 and scenes:
                 filtered = []
                 for st, et in scenes:
-                    if (et.get_frames() - st.get_frames()) >= min_len:
-                        filtered.append((st, et))
+                    scene_len = int(et.get_frames() - st.get_frames())
+                    if scene_len < min_len and scene_len > guard_len:
+                        continue
+                    filtered.append((st, et))
                 # Keep at least one
                 scenes = filtered or [scenes[0]]
 
@@ -931,7 +969,16 @@ class SceneDetectApp:
             # --- 3. AI Validation (Optional) ---
             if self.ai_validate_var.get() and scenes:
                 self.progress_queue.put((70, "AI validating cuts..."))
-                scenes = self._run_ai_validation(video_path, scenes)
+                scenes = self._run_ai_validation(video_path, scenes, guard_len)
+
+            # --- 4. PySceneDetect Refinement (Optional) ---
+            if self.refine_pyscenedetect_var.get() and scenes:
+                self.progress_queue.put((74, "Refining cuts with PySceneDetect..."))
+                scenes = self._refine_with_pyscenedetect(video_path, scenes, fps=fps, total_frames=total_frames)
+
+            # --- 5. Ultra-short Scene Merge (Always On) ---
+            if scenes:
+                scenes = self._merge_ultra_short_scenes(scenes, fps=fps, total_frames=total_frames, max_seconds=0.05)
 
             self.detected_scenes = scenes
             if not self.detected_scenes:
@@ -939,7 +986,7 @@ class SceneDetectApp:
                 self.progress_queue.put((100, "No scenes found."))
                 return
 
-            # --- 4. Output Generation ---
+            # --- 6. Output Generation ---
             self.progress_queue.put((80, "Generating outputs..."))
             base_name = Path(video_path).stem
 
@@ -966,7 +1013,7 @@ class SceneDetectApp:
             messagebox.showerror("Processing Error", str(err))
             self.progress_queue.put((0, "Error."))
 
-    def _run_ai_validation(self, video_path, scenes):
+    def _run_ai_validation(self, video_path, scenes, short_guard_frames: int):
         try:
             import cv2
             import torch
@@ -1710,6 +1757,71 @@ class SceneDetectApp:
                         kept.append(i)
                     return kept
 
+                def _flash_side_decision(self, cut_frame: int, total_frames: int, flash_event: dict):
+                    """Decide which side should own the flash frames based on similarity."""
+                    if not flash_event or not flash_event.get('is_flash', False):
+                        return None
+                    spike = [int(i) for i in (flash_event.get('spike_frames') or [])]
+                    if not spike:
+                        return None
+
+                    # First, use spike distribution around the cut if unambiguous.
+                    pre_count = sum(1 for i in spike if i < cut_frame)
+                    post_count = sum(1 for i in spike if i >= cut_frame)
+                    if pre_count > post_count:
+                        return 'pre'
+                    if post_count > pre_count:
+                        return 'post'
+
+                    flash_vecs = [self.cache[i] for i in spike if i in self.cache]
+                    if not flash_vecs:
+                        return None
+
+                    pre_ids = self._select_stable_indices_near_cut(cut_frame, total_frames, 'pre', flash_event)
+                    post_ids = self._select_stable_indices_near_cut(cut_frame, total_frames, 'post', flash_event)
+                    pre_vecs = [self.cache[i] for i in pre_ids if i in self.cache]
+                    post_vecs = [self.cache[i] for i in post_ids if i in self.cache]
+
+                    if not pre_vecs and not post_vecs:
+                        return None
+                    if pre_vecs and not post_vecs:
+                        return 'pre'
+                    if post_vecs and not pre_vecs:
+                        return 'post'
+
+                    pre_sim = self._pairwise_median_similarity(flash_vecs, pre_vecs)
+                    post_sim = self._pairwise_median_similarity(flash_vecs, post_vecs)
+
+                    if pre_sim >= post_sim:
+                        return 'pre'
+                    return 'post'
+
+                def _adjust_cut_for_flash(self, cut_frame: int, total_frames: int, flash_event: dict, cur_start_f: int, nxt_end_f: int) -> int:
+                    """Move cut to keep flash frames on the most similar side."""
+                    side = self._flash_side_decision(cut_frame, total_frames, flash_event)
+                    if side is None:
+                        return int(cut_frame)
+                    spike = [int(i) for i in (flash_event.get('spike_frames') or [])]
+                    if not spike:
+                        return int(cut_frame)
+                    flash_start = min(spike)
+                    flash_end = max(spike)
+
+                    if side == 'pre':
+                        new_cut = int(flash_end + 1)
+                    else:
+                        new_cut = int(flash_start)
+
+                    min_cut = int(cur_start_f) + 1
+                    max_cut = int(nxt_end_f) - 1
+                    if min_cut > max_cut:
+                        return int(cut_frame)
+                    if new_cut < min_cut:
+                        new_cut = min_cut
+                    if new_cut > max_cut:
+                        new_cut = max_cut
+                    return int(new_cut)
+
                 # --- Cut features + decision ---
 
                 def _cut_features(self, cut_frame: int, window: int, total_frames: int, video_path: str = None):
@@ -1827,11 +1939,11 @@ class SceneDetectApp:
                         'w_large': int(w_large),
                     }
 
-                def validate_cut(self, scene_index: int, cut_frame: int, window: int, total_frames: int, base_thr: float, video_path: str = None) -> bool:
+                def validate_cut(self, scene_index: int, cut_frame: int, window: int, total_frames: int, base_thr: float, video_path: str = None, return_feats: bool = False):
                     """Return True if it is a true cut (KEEP), False if it should be merged (MERGE)."""
                     feats = self._cut_features(cut_frame, window, total_frames, video_path=video_path)
                     if feats is None:
-                        return True
+                        return (True, None) if return_feats else True
 
                     s_raw = float(feats['s_comb_raw'])
                     s_stable = float(feats['s_comb_stable'])
@@ -2023,7 +2135,7 @@ class SceneDetectApp:
                         reason,
                     )
 
-                    return decision_keep
+                    return (decision_keep, feats) if return_feats else decision_keep
 
                 def filter_scenes(self, video_path: str, scenes: list, window: int, abort_flag=None, progress_cb=None) -> list:
                     import cv2
@@ -2092,20 +2204,57 @@ class SceneDetectApp:
                     for i in range(1, len(scenes)):
                         nxt_start, nxt_end = scenes[i]
                         cut_frame_num = int(nxt_start.get_frames())
+                        cur_len = int(cur_end.get_frames() - cur_start.get_frames())
+                        nxt_len = int(nxt_end.get_frames() - nxt_start.get_frames())
 
                         if abort_flag is not None and abort_flag.is_set():
                             raise InterruptedError
 
-                        keep_cut = self.validate_cut(
+                        keep_cut, feats = self.validate_cut(
                             scene_index=i,
                             cut_frame=cut_frame_num,
                             window=w,
                             total_frames=self.total_video_frames,
                             base_thr=base_thr,
                             video_path=video_path,
+                            return_feats=True,
                         )
 
+                        flash = (feats or {}).get('flash') or {}
+                        is_flash = bool(flash.get('is_flash', False))
+                        flash_conf = float(flash.get('conf', 0.0) or 0.0)
+                        s_sscd = (feats or {}).get('s_sscd')
+                        s_stable = float((feats or {}).get('s_comb_stable', (feats or {}).get('s_comb_raw', 0.0)) or 0.0)
+                        spike_frames = flash.get('spike_frames') or []
+                        boundary_hit = bool(flash.get('boundary_hit', False))
+
+                        min_flash_conf = 0.40
+                        if s_sscd is not None:
+                            min_flash_conf = 0.35
+
+                        # Preserve very short scenes by default unless this is a flash-like cut with strong same-shot evidence.
+                        if cur_len <= short_guard_frames or nxt_len <= short_guard_frames:
+                            flash_like = bool(spike_frames) and boundary_hit and (flash_conf >= 0.35)
+                            same_shot = float(s_stable) >= max(0.0, float(base_thr) - 0.05)
+                            if flash_like and same_shot:
+                                keep_cut = False
+                            elif not (is_flash and flash_conf >= min_flash_conf):
+                                keep_cut = True
+
                         if keep_cut:
+                            # If it is a flash but we keep the cut, snap the boundary to the best side.
+                            if is_flash and flash_conf >= min_flash_conf:
+                                new_cut = self._adjust_cut_for_flash(
+                                    cut_frame=cut_frame_num,
+                                    total_frames=self.total_video_frames,
+                                    flash_event=flash,
+                                    cur_start_f=int(cur_start.get_frames()),
+                                    nxt_end_f=int(nxt_end.get_frames()),
+                                )
+                                if new_cut != cut_frame_num:
+                                    cur_end = Timecode(int(new_cut), cur_start.fps)
+                                    nxt_start = Timecode(int(new_cut), cur_start.fps)
+
                             validated_scenes.append((cur_start, cur_end))
                             cur_start, cur_end = nxt_start, nxt_end
                         else:
@@ -2115,6 +2264,67 @@ class SceneDetectApp:
                             progress_cb(min(1.0, i / max(1, len(scenes) - 1)), f'Validating cuts ({i}/{len(scenes) - 1})')
 
                     validated_scenes.append((cur_start, cur_end))
+
+                    # Post-pass: merge tiny flash clips (mid-scene) into the most likely neighbor.
+                    try:
+                        if short_guard_frames and len(validated_scenes) >= 3:
+                            fps_local = float(validated_scenes[0][0].fps) if validated_scenes else 0.0
+                            frames = [
+                                [int(st.get_frames()), int(et.get_frames())]
+                                for st, et in validated_scenes
+                            ]
+
+                            boundary_cache = {}
+
+                            def boundary_info(cut_frame: int):
+                                if cut_frame in boundary_cache:
+                                    return boundary_cache[cut_frame]
+                                feats_b = self._cut_features(cut_frame, w, self.total_video_frames, video_path=video_path)
+                                if feats_b is None:
+                                    info = {'flash_like': False, 'score': 0.0}
+                                else:
+                                    flash_b = (feats_b or {}).get('flash') or {}
+                                    flash_conf_b = float(flash_b.get('conf', 0.0) or 0.0)
+                                    spike_b = flash_b.get('spike_frames') or []
+                                    boundary_hit_b = bool(flash_b.get('boundary_hit', False))
+                                    flash_like_b = bool(spike_b) and boundary_hit_b and (flash_conf_b >= 0.35)
+                                    s_stable_b = float((feats_b or {}).get('s_comb_stable', (feats_b or {}).get('s_comb_raw', 0.0)) or 0.0)
+                                    same_shot_b = float(s_stable_b) >= max(0.0, float(base_thr) - 0.05)
+                                    score_b = (flash_conf_b * 1.2) + (float(s_stable_b) - float(base_thr) if same_shot_b else 0.0)
+                                    info = {'flash_like': flash_like_b, 'score': score_b}
+                                boundary_cache[cut_frame] = info
+                                return info
+
+                            ultra_short_frames = max(1, int(round(float(fps_local) * 0.05))) if fps_local > 0 else 1
+                            i = 1
+                            merged_any = False
+                            while i < len(frames) - 1:
+                                seg_len = int(frames[i][1] - frames[i][0])
+                                if seg_len <= int(short_guard_frames):
+                                    info_pre = boundary_info(frames[i][0])
+                                    info_post = boundary_info(frames[i][1])
+                                    force_merge = seg_len <= ultra_short_frames
+                                    if force_merge or info_pre['flash_like'] or info_post['flash_like']:
+                                        if info_pre['score'] >= info_post['score']:
+                                            frames[i - 1][1] = frames[i][1]
+                                            del frames[i]
+                                            merged_any = True
+                                            continue
+                                        else:
+                                            frames[i + 1][0] = frames[i][0]
+                                            del frames[i]
+                                            merged_any = True
+                                            continue
+                                i += 1
+
+                            if merged_any:
+                                validated_scenes = [
+                                    (Timecode(st, fps_local), Timecode(et, fps_local))
+                                    for st, et in frames
+                                    if et > st
+                                ]
+                    except Exception as e:
+                        self._log.warning('Tiny flash merge post-pass failed: %s', e)
 
                     # Release SSCD video handle (if used)
                     try:
@@ -2160,6 +2370,183 @@ class SceneDetectApp:
             logger.exception("AI validation failed. Skipping.")
             messagebox.showwarning("AI Validation Failed", f"Could not perform AI validation: {e}")
             return scenes
+
+    def _refine_with_pyscenedetect(self, video_path: str, scenes, fps: float, total_frames: int):
+        if not scenes or len(scenes) < 2:
+            return scenes
+
+        snap_window = int(self.refine_snap_var.get() or 0)
+        if snap_window <= 0:
+            return scenes
+
+        try:
+            from scenedetect.detectors import ContentDetector
+        except Exception as e:
+            raise RuntimeError("PySceneDetect is not installed. Install 'scenedetect'.") from e
+
+        # Collect cuts from PySceneDetect (ContentDetector)
+        logger.info(
+            "PySceneDetect refinement: starting (threshold=%.2f, snap_window=%d)",
+            refine_threshold,
+            snap_window,
+        )
+        cut_frames = []
+        refine_threshold = float(self.refine_threshold_var.get() or 27.0)
+
+        try:
+            from scenedetect import open_video, SceneManager
+
+            video = open_video(video_path)
+            scene_manager = SceneManager()
+            try:
+                detector = ContentDetector(threshold=refine_threshold)
+            except TypeError:
+                detector = ContentDetector()
+            scene_manager.add_detector(detector)
+            scene_manager.detect_scenes(video, show_progress=False)
+            scene_list = scene_manager.get_scene_list()
+            if scene_list and len(scene_list) > 1:
+                cut_list = [s[0] for s in scene_list[1:]]
+                cut_frames = [
+                    int(c.get_frames() if hasattr(c, "get_frames") else int(c))
+                    for c in (cut_list or [])
+                ]
+            else:
+                cut_frames = []
+            try:
+                if hasattr(video, "close"):
+                    video.close()
+            except Exception:
+                pass
+        except Exception:
+            # Fallback for older PySceneDetect API
+            from scenedetect.video_manager import VideoManager
+            from scenedetect.scene_manager import SceneManager
+
+            video_manager = VideoManager([video_path])
+            scene_manager = SceneManager()
+            try:
+                detector = ContentDetector(threshold=refine_threshold)
+            except TypeError:
+                detector = ContentDetector()
+            scene_manager.add_detector(detector)
+            video_manager.start()
+            scene_manager.detect_scenes(frame_source=video_manager)
+            scene_list = scene_manager.get_scene_list()
+            if scene_list and len(scene_list) > 1:
+                cut_list = [s[0] for s in scene_list[1:]]
+                cut_frames = [
+                    int(c.get_frames() if hasattr(c, "get_frames") else int(c))
+                    for c in (cut_list or [])
+                ]
+            else:
+                cut_frames = []
+            try:
+                video_manager.release()
+            except Exception:
+                pass
+
+        if not cut_frames:
+            logger.info("PySceneDetect refinement: no cuts found (skipping).")
+            return scenes
+
+        # Normalize + sort
+        cut_frames = sorted(set(int(c) for c in cut_frames if 0 < int(c) < int(total_frames)))
+        logger.info("PySceneDetect refinement: %d candidate cuts.", len(cut_frames))
+
+        # Current cuts from detector
+        orig_cuts = [int(st.get_frames()) for st, _ in scenes[1:]]
+        logger.info("PySceneDetect refinement: %d original cuts.", len(orig_cuts))
+
+        import bisect
+
+        def snap_cut(cut: int) -> int:
+            pos = bisect.bisect_left(cut_frames, cut)
+            candidates = []
+            if pos < len(cut_frames):
+                candidates.append(cut_frames[pos])
+            if pos > 0:
+                candidates.append(cut_frames[pos - 1])
+            if not candidates:
+                return cut
+            nearest = min(candidates, key=lambda x: abs(x - cut))
+            if abs(nearest - cut) <= snap_window:
+                return nearest
+            return cut
+
+        new_cuts = []
+        last = 0
+        snapped = 0
+        for cut in orig_cuts:
+            new_cut = snap_cut(cut)
+            if new_cut != cut:
+                snapped += 1
+                logger.debug("PySceneDetect refinement: snap %d -> %d", cut, new_cut)
+            new_cut = max(new_cut, last + 1)
+            new_cut = min(new_cut, int(total_frames) - 1)
+            new_cuts.append(new_cut)
+            last = new_cut
+        logger.info("PySceneDetect refinement: snapped %d/%d cuts.", snapped, len(orig_cuts))
+
+        # Rebuild scenes
+        out = []
+        start = 0
+        for cut in new_cuts:
+            out.append((Timecode(start, fps), Timecode(cut, fps)))
+            start = cut
+        out.append((Timecode(start, fps), Timecode(total_frames, fps)))
+        return out
+
+    def _merge_ultra_short_scenes(self, scenes, fps: float, total_frames: int, max_seconds: float = 0.05):
+        """Merge ultra-short scenes into neighbors regardless of validation settings."""
+        if not scenes or len(scenes) < 2:
+            return scenes
+
+        if fps <= 0:
+            thr = 1
+        else:
+            thr = max(1, int(round(float(fps) * float(max_seconds))))
+
+        frames = [[int(st.get_frames()), int(et.get_frames())] for st, et in scenes]
+
+        i = 0
+        while i < len(frames):
+            if len(frames) == 1:
+                break
+            seg_len = int(frames[i][1] - frames[i][0])
+            if seg_len <= thr:
+                if i == 0:
+                    # Merge into next
+                    frames[1][0] = frames[0][0]
+                    del frames[0]
+                    continue
+                if i == len(frames) - 1:
+                    # Merge into previous
+                    frames[i - 1][1] = frames[i][1]
+                    del frames[i]
+                    i = max(0, i - 1)
+                    continue
+
+                prev_len = int(frames[i - 1][1] - frames[i - 1][0])
+                next_len = int(frames[i + 1][1] - frames[i + 1][0])
+                if prev_len >= next_len:
+                    frames[i - 1][1] = frames[i][1]
+                    del frames[i]
+                    i = max(0, i - 1)
+                else:
+                    frames[i + 1][0] = frames[i][0]
+                    del frames[i]
+                continue
+            i += 1
+
+        # Rebuild scenes
+        out = []
+        for st_f, et_f in frames:
+            if et_f > st_f:
+                out.append((Timecode(st_f, fps), Timecode(et_f, fps)))
+        if out and total_frames > 0 and out[-1][1].get_frames() < total_frames:
+            out[-1] = (out[-1][0], Timecode(total_frames, fps))
+        return out
 
     def _abort_detection(self): self.abort_flag.set()
     def _export_csv(self, filename: Path):

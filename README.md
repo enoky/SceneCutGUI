@@ -38,6 +38,7 @@ torchvision
 torchaudio
 einops
 transnetv2-pytorch
+scenedetect
 transformers
 numpy
 opencv-contrib-python with CUDA (see link below)
@@ -129,7 +130,7 @@ RUN_SceneCutGUI.bat
 | --------------- | --------------------------------------- | --------------------------------------------- |
 | `device`        | `auto`                                  | Compute device (`auto`, `cuda`, `cpu`, `mps`) |
 | `threshold`     | `0.296` (AutoShot) / `0.3` (TransNetV2) | Cut detection sensitivity (0–1)               |
-| `min_scene_len` | `8`                                     | Minimum scene length in frames                |
+| `min_scene_len` | `8`                                     | Minimum scene length in frames (very short scenes are preserved by default) |
 
 ### AI Validation (Optional)
 
@@ -137,6 +138,14 @@ RUN_SceneCutGUI.bat
 | ------------- | ------- | ---------------------------------- |
 | `ai_validate` | `false` | Enable DINOv3 validation           |
 | `ai_window`   | `3`     | Frames before/after cut to analyze |
+
+### PySceneDetect Refinement (Optional)
+
+| Parameter              | Default | Description |
+| ---------------------- | ------- | ----------- |
+| `refine_pyscenedetect` | `false` | Snap cuts to nearest PySceneDetect ContentDetector cut |
+| `refine_snap`          | `6`     | Snap window in frames |
+| `refine_threshold`     | `27.0`  | PySceneDetect ContentDetector threshold |
 
 ### FFmpeg Output Settings
 

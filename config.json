@@ -1,0 +1,33 @@
+{
+    "video_path": "C:/Users/Nexus/Videos/_3D_Conv_/StrangerTings/StrangerThings4e7-clip.mkv",
+    "output_dir": "C:\\Users\\Nexus\\Videos\\_3D_Conv_\\StrangerTings\\StrangerThings4e7-clip",
+    "detector_type": "TransNetV2",
+    "detector_params": {
+        "AutoShot": {
+            "device": "auto",
+            "threshold": "0.296",
+            "min_scene_len": "6"
+        },
+        "TransNetV2": {
+            "device": "auto",
+            "threshold": "0.5",
+            "min_scene_len": "6"
+        }
+    },
+    "ai_validate": true,
+    "ai_window": 5,
+    "flash_sensitivity": 15,
+    "refine_pyscenedetect": true,
+    "refine_snap": 6,
+    "refine_threshold": 20.0,
+    "export_csv": false,
+    "export_html": false,
+    "export_sc": true,
+    "save_images": false,
+    "split_video": true,
+    "num_images": 3,
+    "frame_margin": 1,
+    "ffmpeg_codec": "h264_nvenc",
+    "ffmpeg_preset": "p5",
+    "ffmpeg_cq": 16
+}

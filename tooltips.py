@@ -18,7 +18,7 @@ TOOLTIPS: dict[str, str] = {
     
     # ContentDetector parameters
     "threshold": "How different two frames must be to be a cut. Lower values are more sensitive and will find more scenes.",
-    "min_scene_len": "The smallest allowed scene length in frames. Prevents creating very short, choppy scenes.",
+    "min_scene_len": "Minimum scene length in frames. Scenes shorter than ~0.30s are preserved by default to avoid losing very short cuts.",
     "weights_hue": "How much to weigh changes in color (e.g., red vs. blue) when comparing frames.",
     "weights_sat": "How much to weigh changes in color intensity (e.g., dull vs. vibrant) when comparing frames.",
     "weights_lum": "How much to weigh changes in brightness (e.g., light vs. dark) when comparing frames.",
@@ -43,6 +43,9 @@ TOOLTIPS: dict[str, str] = {
     "ai_validate": "Use a DINOv3 model to validate cuts and filter out flashes/fast motion. Requires a CUDA-enabled GPU.",
     "ai_window": "Number of frames before and after a cut to analyze for AI validation.",
     "flash_sensitivity": "Sensitivity for detecting flash spikes versus scene cuts. Lower values (15-25) detect flashes more aggressively. Default: 15.",
+    "refine_pyscenedetect": "Snap detected cuts to the nearest PySceneDetect ContentDetector cut within a small window for frame-accurate boundaries.",
+    "refine_snap": "Maximum frames to snap a detected cut to a PySceneDetect cut. Use 0 to disable snapping.",
+    "refine_threshold": "ContentDetector threshold for PySceneDetect refinement. Lower detects more cuts, higher detects fewer.",
     
     # Output and statistics
     "stats_enabled": "Enable logging of detection metrics to a CSV file.",
