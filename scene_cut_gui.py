@@ -640,35 +640,44 @@ class SceneDetectApp:
 
             class DinoCutValidator:
                 """
-                DINOv3-based cut validator that filters false-positive cuts (flashes / fast motion / near-black).
+                DINOv3-based cut validator with a flash-aware merge policy.
 
-                Drop-in notes:
-                  - Expects: os, logging, cv2, torch, numpy as np
-                  - Expects: from transformers import AutoImageProcessor, AutoModel
-                  - You can pass your app logger in; otherwise it creates its own.
+                What this replaces:
+                  - The prior "prove flash or KEEP" policy that effectively never merged cuts. 
+
+                What this does instead (modern SBD practice):
+                  1) Detect transient *brightness outliers* around the boundary (flash / lightning / strobe / black-flash)
+                     using robust statistics (median + MAD) on a temporal window.
+                  2) Recompute cross-boundary similarity using "stable" frames that exclude the flash frames.
+                  3) Merge only when flash confidence is high AND stable-frame similarity indicates the same shot.
+                     (Adjacent-frame discontinuity is treated as strong cut evidence unless overridden by a flash event.)
                 """
 
-                # Conservative defaults: only merge when the evidence is strong.
+                # --- General ---
                 DEFAULT_BASE_THRESHOLD = 0.88
-
-                # Windows & sampling
                 MAX_LARGE_WINDOW = 24
 
-                # Decision margins
-                MERGE_MARGIN = 0.01
+                # SSCD stable-frame settings (used only when SSCD is available)
+                SSCD_K = 5             # median of up to 5 frames per side
+                SSCD_MIN_K = 3         # need at least 3 frames per side (else fallback)
 
-                # Cheap cues
-                FLASH_LUMA_DELTA = 30.0  # Lower default for better flash detection
-                FLASH_HIGH_LUMA = 180.0  # White-flash detection threshold
-                NEAR_BLACK_LUMA = 18.0
+                # Adjacent-frame discontinuity = strong cut evidence (unless flash is strong)
+                ADJ_STRONG_CUT = 0.68
 
-                # Adjacent-frame continuity gating
-                ADJ_KEEP_CUTOFF = 0.70
-                ADJ_MERGE_CUTOFF = 0.78
+                # --- Flash detection window (frames relative to cut_frame) ---
+                FLASH_SCAN = 12         # analyze +/- this many frames around cut
+                FLASH_CENTER = 4        # spike must occur within +/- this region
+                FLASH_BASE_GAP = 5      # baseline windows start beyond this offset from the cut
 
-                # Confidence / motion adjustments
-                MOTION_BOOST = 0.06      # threshold += MOTION_BOOST * motion_score
-                BLACK_BOOST = 0.03       # threshold += BLACK_BOOST if near-black
+                FLASH_MIN_DUR = 1
+                FLASH_MAX_DUR = 6
+
+                # --- Pixel cue (HSV H,S histogram intersection in [0,1]) ---
+                PIXEL_HIST_MIN = 0.08
+                PIXEL_HIST_STRONG = 0.14
+
+                # --- Similarity guardrails ---
+                MIN_STABLE_SIM = 0.72   # absolute floor for merging on flash evidence
 
                 # ANSI color helpers for console output (optional)
                 KEEP_FG = "\033[94m"
@@ -676,68 +685,338 @@ class SceneDetectApp:
                 BOLD = "\033[1m"
                 RESET = "\033[0m"
 
-                def __init__(self, model_dir: str = "./weights", device=None, batch_size: int = 48, flash_luma_delta: float = 30.0, logger=None):
+                def __init__(self, model_dir: str = './weights', device=None, batch_size: int = 48,
+                             flash_luma_delta: float = 30.0,
+                             enable_sscd: bool = True, sscd_model_path: str = None, sscd_input: int = 288,
+                             logger=None):
                     import os
                     import logging
                     import torch
                     from transformers import AutoImageProcessor, AutoModel
 
-                    self._log = logger or logging.getLogger("DinoCutValidator")
+                    self._log = logger or logging.getLogger('DinoCutValidator')
 
                     if not os.path.isdir(model_dir):
-                        raise FileNotFoundError(f"DINOv3 model directory not found: {model_dir}")
+                        raise FileNotFoundError(f'DINOv3 model directory not found: {model_dir}')
 
-                    self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-                    if self.device == "cpu":
-                        raise RuntimeError("AI Validation requires a CUDA-enabled GPU and PyTorch.")
+                    self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+                    if self.device == 'cpu':
+                        raise RuntimeError('AI Validation requires a CUDA-enabled GPU and PyTorch.')
 
-                    self._log.debug("Loading DINOv3 model on device: %s", self.device)
+                    self._log.debug('Loading DINOv3 model on device: %s', self.device)
                     self.processor = AutoImageProcessor.from_pretrained(model_dir, local_files_only=True)
                     self.model = AutoModel.from_pretrained(model_dir, local_files_only=True).to(self.device).eval()
 
-                    # Cache
-                    self.cache = {}         # frame_idx -> torch.Tensor embedding (normalized)
-                    self.luma_cache = {}    # frame_idx -> float luma mean (0-255)
+                    # Caches keyed by frame_idx
+                    self.cache = {}        # frame_idx -> torch.Tensor embedding (normalized)
+                    self.luma_cache = {}   # frame_idx -> float mean luma (0-255)
+                    self.vhi_cache = {}    # frame_idx -> float HSV-V p99.5 (0-255), catches sparse lightning
+                    self.hist_cache = {}   # frame_idx -> np.ndarray HSV (H,S) hist (L1 normalized)
+
                     self.batch_size = int(batch_size)
                     self.total_video_frames = 0
-                    
-                    # Configurable flash sensitivity (luma delta threshold)
+
+                    # User sensitivity knob: smaller -> more sensitive (merge more flash cuts)
                     self.flash_luma_delta = float(flash_luma_delta)
 
                     # Precompute normalization tensors
+                    import torch
                     self._mean = torch.tensor(self.processor.image_mean, device=self.device).view(1, 3, 1, 1)
                     self._std = torch.tensor(self.processor.image_std, device=self.device).view(1, 3, 1, 1)
+                    # ---- Optional SSCD (photometric-invariant descriptor) ----
+                    self.sscd_model = None
+                    self.sscd_input = int(sscd_input)
+                    self._sscd_video_path = None
+                    self._sscd_cap = None
+                    from collections import OrderedDict
+                    self._sscd_frame_cache = OrderedDict()  # frame_idx -> resized RGB uint8
+                    self._sscd_frame_cache_max = 128
+                    # SSCD hub models typically use ImageNet normalization
+                    self._sscd_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+                    self._sscd_std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+                    if bool(enable_sscd):
+                        try:
+                            if sscd_model_path is None:
+                                sscd_model_path = os.path.join(model_dir, 'sscd_disc_large.torchscript.pt')
+                            self._init_sscd(sscd_model_path)
+                            self._log.info('SSCD enabled (torchscript: %s).', sscd_model_path)
+                        except Exception as e:
+                            self.sscd_model = None
+                            self._log.warning('SSCD unavailable (continuing with DINO-only): %s', e)
+
 
                 def _target_size(self):
-                    # Transformers image processor may define size in a few forms.
-                    size = getattr(self.processor, "size", None) or {}
+                    size = getattr(self.processor, 'size', None) or {}
                     if isinstance(size, dict):
-                        h = int(size.get("height") or size.get("shortest_edge") or 224)
-                        w = int(size.get("width") or size.get("shortest_edge") or 224)
+                        h = int(size.get('height') or size.get('shortest_edge') or 224)
+                        w = int(size.get('width') or size.get('shortest_edge') or 224)
                     else:
                         h = w = 224
-                    # OpenCV uses (width, height)
-                    return (w, h)
+                    return (w, h)  # OpenCV uses (width, height)
 
                 @staticmethod
                 def _luma_from_rgb(rgb_uint8) -> float:
-                    # rgb_uint8: HxWx3 uint8; Rec. 709 luma coefficients.
                     import numpy as np
-
                     r = rgb_uint8[:, :, 0].astype(np.float32)
                     g = rgb_uint8[:, :, 1].astype(np.float32)
                     b = rgb_uint8[:, :, 2].astype(np.float32)
                     return float((0.2126 * r + 0.7152 * g + 0.0722 * b).mean())
 
+                @staticmethod
+                def _hsv_hist_and_vhi_from_rgb(rgb_uint8):
+                    """Return (hist_flat, v_hi_p995)."""
+                    import numpy as np
+                    import cv2
+
+                    hsv = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2HSV)
+
+                    # Pixel cue: coarse H,S histogram
+                    hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+                    hist = hist.astype(np.float32)
+                    s = float(hist.sum())
+                    if s > 1e-6:
+                        hist /= s
+                    hist_flat = hist.reshape(-1)
+
+                    v = hsv[:, :, 2].astype(np.float32)
+                    v_hi = float(np.percentile(v, 99.5))
+                    return hist_flat, v_hi
+
+                @staticmethod
+                def _hist_intersection(h1, h2) -> float:
+                    import numpy as np
+                    if h1 is None or h2 is None:
+                        return float('nan')
+                    return float(np.minimum(h1, h2).sum())
+
+                def _flash_signal(self, frame_idx: int):
+                    """Single scalar flash signal per frame, designed to catch sparse lightning.
+
+                    We use max(mean_luma, V_p99.5). V_p99.5 catches lightning bolts that occupy few pixels.
+                    """
+                    l = self.luma_cache.get(frame_idx)
+                    v = self.vhi_cache.get(frame_idx)
+                    if l is None and v is None:
+                        return None
+                    if l is None:
+                        return float(v)
+                    if v is None:
+                        return float(l)
+                    return float(max(float(l), float(v)))
+
                 def _embed_batch(self, images_tensor):
                     import torch
-
-                    # images_tensor: (B, 3, H, W), float32 0-255
                     with torch.inference_mode():
                         images_tensor = (images_tensor / 255.0 - self._mean) / self._std
                         outputs = self.model(pixel_values=images_tensor)
                         pooled = outputs.pooler_output
                         return torch.nn.functional.normalize(pooled, dim=-1)
+
+                # ---- SSCD helpers (optional) ----
+                def _init_sscd(self, model_path: str):
+                    """Load SSCD TorchScript model from disk.
+
+                    SSCD is a photometric-robust descriptor for copy / near-duplicate detection.
+                    Here it is used only as a *flash-robust same-shot* signal by comparing
+                    median-composited stable frames (3-5 frames per side) across the boundary.
+
+                    The common SSCD preprocessing is:
+                      - resize to 288x288
+                      - ToTensor() in [0,1]
+                      - ImageNet normalize (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+                    """
+                    import os
+                    import torch
+
+                    p = str(model_path or '')
+                    if not p:
+                        raise ValueError('SSCD model_path is empty.')
+                    # Resolve relative paths against the current working directory.
+                    if not os.path.isabs(p):
+                        p = os.path.normpath(p)
+                    if not os.path.exists(p):
+                        # Best-effort fallback: try alongside the DINO weights directory.
+                        alt = os.path.join('./weights', os.path.basename(p))
+                        if os.path.exists(alt):
+                            p = alt
+                        else:
+                            raise FileNotFoundError(f'SSCD TorchScript file not found: {model_path}')
+
+                    self._log.info('Loading SSCD TorchScript model: %s', p)
+                    m = torch.jit.load(p, map_location=self.device)
+                    try:
+                        m = m.to(self.device)
+                    except Exception:
+                        pass
+                    m.eval()
+                    self.sscd_model = m
+
+                def _sscd_required_sim(self, motion: float) -> float:
+                    """Dynamic SSCD threshold driven by the GUI Flash Sensitivity knob.
+
+                    Lower Flash Sensitivity => more aggressive flash merging => lower required SSCD sim.
+                    """
+                    sens = float(max(15.0, min(80.0, getattr(self, 'flash_luma_delta', 30.0))))
+                    # sens=15 -> ~0.68 ; sens=80 -> ~0.78
+                    base = 0.78 - 0.0015 * (80.0 - sens)
+                    base = base - 0.05 * float(max(0.0, min(1.0, motion)))
+                    return float(max(0.62, min(0.84, base)))
+
+                def _sscd_get_cap(self, video_path: str):
+                    import cv2
+                    if (self._sscd_cap is None) or (self._sscd_video_path != video_path):
+                        try:
+                            if self._sscd_cap is not None:
+                                self._sscd_cap.release()
+                        except Exception:
+                            pass
+                        self._sscd_video_path = video_path
+                        self._sscd_cap = cv2.VideoCapture(video_path)
+                        if not self._sscd_cap.isOpened():
+                            raise RuntimeError(f'Could not open video for SSCD decode: {video_path}')
+                    return self._sscd_cap
+
+                def _sscd_read_frame_rgb(self, video_path: str, frame_idx: int):
+                    """Read + resize an RGB frame for SSCD; cached with a small LRU."""
+                    import cv2
+                    import numpy as np
+
+                    # LRU cache hit
+                    if frame_idx in self._sscd_frame_cache:
+                        rgb = self._sscd_frame_cache.pop(frame_idx)
+                        self._sscd_frame_cache[frame_idx] = rgb
+                        return rgb
+
+                    cap = self._sscd_get_cap(video_path)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        return None
+                    frame = cv2.resize(frame, (self.sscd_input, self.sscd_input), interpolation=cv2.INTER_AREA)
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                    # Insert into LRU
+                    self._sscd_frame_cache[frame_idx] = rgb
+                    if len(self._sscd_frame_cache) > int(self._sscd_frame_cache_max):
+                        self._sscd_frame_cache.popitem(last=False)
+                    return rgb
+
+                def _sscd_embed_rgb(self, rgb_uint8):
+                    import torch
+                    import torch.nn.functional as F
+                    if rgb_uint8 is None:
+                        return None
+                    x = torch.from_numpy(rgb_uint8).to(self.device).float() / 255.0
+                    x = x.permute(2, 0, 1).unsqueeze(0).contiguous()
+                    x = (x - self._sscd_mean) / self._sscd_std
+                    with torch.inference_mode():
+                        out = self.sscd_model(x)
+                    # TorchScript usually returns a Tensor; keep some generic handling anyway.
+                    if isinstance(out, (tuple, list)):
+                        out = out[0]
+                    if isinstance(out, dict):
+                        out = out.get('embeddings') or out.get('embedding') or next(iter(out.values()))
+                    if not torch.is_tensor(out):
+                        return None
+                    if out.dim() == 2:
+                        out = out[0]
+                    v = out.flatten()
+                    return F.normalize(v, dim=0)
+
+                @staticmethod
+                def _median_composite(frames_rgb_list):
+                    import numpy as np
+                    if not frames_rgb_list:
+                        return None
+                    stack = np.stack(frames_rgb_list, axis=0).astype(np.float32)
+                    comp = np.median(stack, axis=0)
+                    comp = np.clip(comp, 0, 255).astype(np.uint8)
+                    return comp
+
+                def _select_stable_indices_near_cut(self, cut_frame: int, total_frames: int, side: str, flash_event: dict):
+                    """Pick 3-5 stable frames close to the boundary for SSCD median compositing."""
+                    spike = set(int(x) for x in (flash_event.get('spike_frames') or []))
+                    baseline = flash_event.get('baseline')
+                    amp = float(flash_event.get('amp', 0.0) or 0.0)
+
+                    # Candidate order: closest to boundary first
+                    if side == 'pre':
+                        cands = [cut_frame - k for k in range(1, 1 + 12)]
+                    else:
+                        cands = [cut_frame + k for k in range(0, 12)]
+                    cands = [int(max(0, min(total_frames - 1, i))) for i in cands]
+
+                    # If we don't know baseline yet, just take the closest frames excluding spikes
+                    if baseline is None:
+                        chosen = []
+                        for i in cands:
+                            if i in spike:
+                                continue
+                            chosen.append(i)
+                            if len(chosen) >= self.SSCD_K:
+                                break
+                        return chosen
+
+                    # Tolerance: accept frames close to baseline, excluding spike frames
+                    tol = float(max(12.0, 0.35 * abs(amp)))
+                    chosen = []
+                    for i in cands:
+                        if i in spike:
+                            continue
+                        v = self._flash_signal(i)
+                        if v is None:
+                            continue
+                        if abs(float(v) - float(baseline)) <= tol:
+                            chosen.append(i)
+                            if len(chosen) >= self.SSCD_K:
+                                break
+
+                    # If too few, relax tolerance once
+                    if len(chosen) < self.SSCD_MIN_K:
+                        tol2 = tol * 1.6
+                        chosen = []
+                        for i in cands:
+                            if i in spike:
+                                continue
+                            v = self._flash_signal(i)
+                            if v is None:
+                                continue
+                            if abs(float(v) - float(baseline)) <= tol2:
+                                chosen.append(i)
+                                if len(chosen) >= self.SSCD_K:
+                                    break
+
+                    return chosen
+
+                def _sscd_stable_similarity(self, video_path: str, cut_frame: int, total_frames: int, flash_event: dict):
+                    """Compute SSCD cosine similarity between median-composited stable frames."""
+                    import math
+                    if (self.sscd_model is None) or (not video_path):
+                        return None
+
+                    pre_ids = self._select_stable_indices_near_cut(cut_frame, total_frames, 'pre', flash_event)
+                    post_ids = self._select_stable_indices_near_cut(cut_frame, total_frames, 'post', flash_event)
+                    if len(pre_ids) < self.SSCD_MIN_K or len(post_ids) < self.SSCD_MIN_K:
+                        return None
+
+                    pre_frames = [self._sscd_read_frame_rgb(video_path, i) for i in pre_ids]
+                    post_frames = [self._sscd_read_frame_rgb(video_path, i) for i in post_ids]
+                    pre_frames = [f for f in pre_frames if f is not None]
+                    post_frames = [f for f in post_frames if f is not None]
+                    if len(pre_frames) < self.SSCD_MIN_K or len(post_frames) < self.SSCD_MIN_K:
+                        return None
+
+                    pre_comp = self._median_composite(pre_frames)
+                    post_comp = self._median_composite(post_frames)
+                    e1 = self._sscd_embed_rgb(pre_comp)
+                    e2 = self._sscd_embed_rgb(post_comp)
+                    if e1 is None or e2 is None:
+                        return None
+                    sim = float((e1 * e2).sum().item())
+                    if math.isnan(sim):
+                        return None
+                    return sim
+
 
                 def _embed_all_required_frames(self, video_path: str, indices_to_embed, abort_flag=None, progress_cb=None):
                     import cv2
@@ -747,20 +1026,19 @@ class SceneDetectApp:
                     if not indices:
                         return
 
-                    self._log.info("Embedding %d unique frames for validation...", len(indices))
+                    self._log.info('Embedding %d unique frames for validation...', len(indices))
                     indices_set = set(indices)
 
                     target_size = self._target_size()
                     batch, batch_ids = [], []
 
-                    # Prefer GPU decode, but fall back to CPU decode if unavailable.
                     use_cuda_decode = True
                     try:
                         gpu_frame = cv2.cuda_GpuMat()
                         cap = cv2.cudacodec.createVideoReader(video_path)
                     except Exception as e:
                         use_cuda_decode = False
-                        self._log.warning("CUDA video reader unavailable (falling back to CPU decode): %s", e)
+                        self._log.warning('CUDA video reader unavailable (falling back to CPU decode): %s', e)
                         cap = cv2.VideoCapture(video_path)
 
                     def flush_batch():
@@ -788,7 +1066,6 @@ class SceneDetectApp:
 
                             if frame_idx in indices_set:
                                 resized_gpu = cv2.cuda.resize(gpu_frame, target_size)
-                                # cudacodec often returns BGRA; try BGRA->RGB, else BGR->RGB.
                                 try:
                                     rgb_gpu = cv2.cuda.cvtColor(resized_gpu, cv2.COLOR_BGRA2RGB)
                                 except Exception:
@@ -796,16 +1073,18 @@ class SceneDetectApp:
 
                                 rgb = rgb_gpu.download()
 
-                                # Ensure we have 3 channels
                                 if rgb.ndim == 3 and rgb.shape[2] == 4:
                                     rgb = cv2.cvtColor(rgb, cv2.COLOR_BGRA2RGB)
-                                elif rgb.ndim == 3 and rgb.shape[2] == 3:
-                                    pass
-                                else:
+                                elif not (rgb.ndim == 3 and rgb.shape[2] == 3):
                                     frame_idx += 1
                                     continue
 
-                                self.luma_cache[frame_idx] = self._luma_from_rgb(rgb)
+                                luma = self._luma_from_rgb(rgb)
+                                hist, v_hi = self._hsv_hist_and_vhi_from_rgb(rgb)
+
+                                self.luma_cache[frame_idx] = luma
+                                self.vhi_cache[frame_idx] = v_hi
+                                self.hist_cache[frame_idx] = hist
 
                                 t = torch.as_tensor(rgb, device=self.device)
                                 t = t.permute(2, 0, 1).contiguous().float()
@@ -820,7 +1099,13 @@ class SceneDetectApp:
                             if frame_idx in indices_set:
                                 frame = cv2.resize(frame, target_size)
                                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                self.luma_cache[frame_idx] = self._luma_from_rgb(rgb)
+
+                                luma = self._luma_from_rgb(rgb)
+                                hist, v_hi = self._hsv_hist_and_vhi_from_rgb(rgb)
+
+                                self.luma_cache[frame_idx] = luma
+                                self.vhi_cache[frame_idx] = v_hi
+                                self.hist_cache[frame_idx] = hist
 
                                 t = torch.from_numpy(rgb).to(self.device)
                                 t = t.permute(2, 0, 1).contiguous().float()
@@ -832,7 +1117,7 @@ class SceneDetectApp:
                             flush_batch()
 
                         if progress_cb and total_wanted > 0 and frame_idx % 50 == 0:
-                            progress_cb(min(1.0, wanted_i / total_wanted), f"Embedding frames ({wanted_i}/{total_wanted})")
+                            progress_cb(min(1.0, wanted_i / total_wanted), f'Embedding frames ({wanted_i}/{total_wanted})')
 
                         frame_idx += 1
 
@@ -841,13 +1126,13 @@ class SceneDetectApp:
                     if not use_cuda_decode:
                         cap.release()
 
-                    self._log.info("Frame embedding complete (%d cached).", len(self.cache))
+                    self._log.info('Frame embedding complete (%d cached).', len(self.cache))
+
+                # --- Similarity helpers ---
 
                 @staticmethod
                 def _pairwise_median_similarity(pre_vecs, post_vecs) -> float:
                     import torch
-
-                    # pre/post vectors are already normalized.
                     pre = torch.stack(pre_vecs, dim=0)
                     post = torch.stack(post_vecs, dim=0)
                     sim = pre @ post.T
@@ -856,7 +1141,6 @@ class SceneDetectApp:
                 @staticmethod
                 def _avg_adjacent_similarity(vecs) -> float:
                     import torch
-
                     if len(vecs) < 2:
                         return 1.0
                     mat = torch.stack(vecs, dim=0)
@@ -866,8 +1150,6 @@ class SceneDetectApp:
                 @staticmethod
                 def _otsu_threshold(scores, bins: int = 128) -> float:
                     import numpy as np
-
-                    # scores in [0, 1]
                     scores = np.clip(scores.astype(np.float32), 0.0, 1.0)
                     hist, bin_edges = np.histogram(scores, bins=bins, range=(0.0, 1.0))
                     hist = hist.astype(np.float32)
@@ -888,41 +1170,228 @@ class SceneDetectApp:
 
                 def _auto_threshold(self, cut_scores) -> float:
                     import numpy as np
-
                     if len(cut_scores) < 10:
                         return float(self.DEFAULT_BASE_THRESHOLD)
 
                     s = np.array(cut_scores, dtype=np.float32)
                     if np.std(s) < 0.01:
-                        # Not much signal in this video; keep conservative.
                         return float(np.clip(float(np.mean(s)) + 0.01, 0.86, 0.93))
 
                     t_otsu = self._otsu_threshold(s)
                     p75 = float(np.percentile(s, 75))
                     p90 = float(np.percentile(s, 90))
 
-                    # Keep threshold in a safe, high-similarity band.
                     thr = max(p75, min(t_otsu, p90))
-                    return float(np.clip(thr, 0.86, 0.94))
+                    return float(np.clip(thr, 0.84, 0.94))
 
                 def _window_indices(self, cut_frame: int, window: int, gap: int, total_frames: int):
-                    # Sample away from boundary by 'gap' frames.
                     pre_end = max(0, cut_frame - gap)
                     pre_start = max(0, pre_end - window)
                     post_start = min(total_frames, cut_frame + gap)
                     post_end = min(total_frames, post_start + window)
                     return list(range(pre_start, pre_end)), list(range(post_start, post_end))
 
-                def _cut_features(self, cut_frame: int, window: int, total_frames: int):
-                    gap = max(2, int(window))
+                # --- Flash detection ---
+
+                @staticmethod
+                def _mad(values, center):
+                    import numpy as np
+                    arr = np.asarray(values, dtype=np.float32)
+                    return float(np.median(np.abs(arr - float(center))))
+
+                @staticmethod
+                def _longest_consecutive_run(idxs):
+                    """Return the indices belonging to the longest consecutive run."""
+                    if not idxs:
+                        return []
+                    idxs = sorted(set(int(x) for x in idxs))
+                    best = [idxs[0]]
+                    cur = [idxs[0]]
+                    for x in idxs[1:]:
+                        if x == cur[-1] + 1:
+                            cur.append(x)
+                        else:
+                            if len(cur) > len(best):
+                                best = cur
+                            cur = [x]
+                    if len(cur) > len(best):
+                        best = cur
+                    return best
+
+                def _detect_flash_event(self, cut_frame: int, total_frames: int):
+                    """Detect flash/black-flash near a cut boundary using median + MAD.
+
+                    Returns dict:
+                      is_flash: bool
+                      conf: 0..1
+                      kind: 'bright'|'dark'|None
+                      amp: float
+                      dur: int
+                      drift: float (pre/post baseline difference)
+                      baseline_pre/baseline_post/baseline: floats
+                      spike_frames: list[int] (frames to exclude)
+                    """
+                    import numpy as np
+
+                    def clamp(i: int) -> int:
+                        return int(max(0, min(total_frames - 1, i)))
+
+                    # Build windows
+                    center_ids = [clamp(cut_frame + k) for k in range(-self.FLASH_CENTER, self.FLASH_CENTER + 1)]
+                    pre_base_ids = [clamp(cut_frame + k) for k in range(-self.FLASH_SCAN, -self.FLASH_BASE_GAP)]
+                    post_base_ids = [clamp(cut_frame + k) for k in range(self.FLASH_BASE_GAP, self.FLASH_SCAN + 1)]
+
+                    base_vals_pre = [self._flash_signal(i) for i in pre_base_ids]
+                    base_vals_pre = [v for v in base_vals_pre if v is not None]
+                    base_vals_post = [self._flash_signal(i) for i in post_base_ids]
+                    base_vals_post = [v for v in base_vals_post if v is not None]
+
+                    if len(base_vals_pre) + len(base_vals_post) < 6:
+                        return {
+                            'is_flash': False, 'conf': 0.0, 'kind': None, 'amp': 0.0, 'dur': 0, 'drift': None,
+                            'baseline_pre': None, 'baseline_post': None, 'baseline': None, 'spike_frames': []
+                        }
+
+                    baseline_pre = float(np.median(base_vals_pre)) if base_vals_pre else float(np.median(base_vals_post))
+                    baseline_post = float(np.median(base_vals_post)) if base_vals_post else float(np.median(base_vals_pre))
+                    baseline = float(np.median([baseline_pre, baseline_post]))
+                    drift = float(abs(baseline_pre - baseline_post))
+
+                    base_vals = base_vals_pre + base_vals_post
+                    mad = self._mad(base_vals, baseline)
+                    mad = float(max(1.0, 1.4826 * mad))  # robust scale (avoid div0)
+
+                    center_vals = [(i, self._flash_signal(i)) for i in center_ids]
+                    center_vals = [(i, v) for (i, v) in center_vals if v is not None]
+                    if not center_vals:
+                        return {
+                            'is_flash': False, 'conf': 0.0, 'kind': None, 'amp': 0.0, 'dur': 0, 'drift': drift,
+                            'baseline_pre': baseline_pre, 'baseline_post': baseline_post, 'baseline': baseline, 'spike_frames': []
+                        }
+
+                    # Determine whether we have a bright or dark outlier.
+                    pos = [(i, float(v) - baseline) for (i, v) in center_vals]
+                    neg = [(i, baseline - float(v)) for (i, v) in center_vals]
+                    pos_max = max(d for _, d in pos)
+                    neg_max = max(d for _, d in neg)
+
+                    kind = 'bright' if pos_max >= neg_max else 'dark'
+                    deltas = pos if kind == 'bright' else neg
+                    amp = float(max(d for _, d in deltas))
+
+                    # Sensitivity: require some absolute amplitude, plus robust z-score.
+                    amp_thr = float(max(10.0, 0.6 * self.flash_luma_delta))
+                    z = float(amp / mad)
+
+                    # Candidate spike frames (within center)
+                    spike = [i for (i, d) in deltas if d >= max(amp_thr, 0.45 * amp_thr) and (d / mad) >= 2.8]
+                    spike_run = self._longest_consecutive_run(spike)
+                    dur = int(len(spike_run))
+
+                    boundary_hit = any(abs(i - cut_frame) <= 1 for i in spike_run)
+
+                    # Return-to-baseline: allow some drift proportional to amplitude.
+                    # Lightning storms can shift exposure a bit; use ratio rather than a fixed cutoff.
+                    if amp <= 1e-3:
+                        return_ok = False
+                    else:
+                        return_ok = bool(drift <= max(12.0, 0.60 * amp))
+
+                    # Confidence
+                    amp_score = (amp - amp_thr) / max(1e-6, (1.8 * amp_thr))
+                    amp_score = float(np.clip(amp_score, 0.0, 1.0))
+                    z_score = float(np.clip((z - 3.0) / 3.5, 0.0, 1.0))
+
+                    if dur <= 0:
+                        dur_score = 0.0
+                    elif dur <= 3:
+                        dur_score = 1.0
+                    elif dur <= self.FLASH_MAX_DUR:
+                        dur_score = 0.75
+                    else:
+                        dur_score = 0.0
+
+                    if amp <= 1e-3:
+                        return_score = 0.0
+                    else:
+                        ratio = drift / amp
+                        if ratio <= 0.30:
+                            return_score = 1.0
+                        elif ratio <= 0.60:
+                            return_score = 0.7
+                        elif ratio <= 1.00:
+                            return_score = 0.25
+                        else:
+                            return_score = 0.0
+
+                    conf = float(np.clip(0.55 * amp_score + 0.15 * z_score + 0.15 * dur_score + 0.15 * return_score, 0.0, 1.0))
+                    if not boundary_hit:
+                        conf *= 0.5
+
+                    is_flash = bool(
+                        conf >= 0.55 and boundary_hit and (self.FLASH_MIN_DUR <= dur <= self.FLASH_MAX_DUR)
+                    )
+
+                    # Exclusion frames: spike run + 1-frame padding
+                    spike_frames = sorted(set([clamp(i + k) for i in spike_run for k in (-1, 0, 1)]))
+
+                    return {
+                        'is_flash': is_flash,
+                        'conf': conf,
+                        'kind': kind if is_flash else None,
+                        'amp': amp,
+                        'dur': dur,
+                        'drift': drift,
+                        'baseline_pre': baseline_pre,
+                        'baseline_post': baseline_post,
+                        'baseline': baseline,
+                        'spike_frames': spike_frames,
+                        'z': z,
+                        'amp_thr': amp_thr,
+                        'boundary_hit': boundary_hit,
+                        'return_ok': return_ok,
+                    }
+
+                def _stable_indices(self, indices, flash_event):
+                    """Remove flash frames + lingering outliers from similarity windows."""
+                    if not indices:
+                        return []
+                    if not flash_event or not flash_event.get('is_flash', False):
+                        return list(indices)
+
+                    baseline = flash_event.get('baseline')
+                    amp = float(flash_event.get('amp') or 0.0)
+                    kind = flash_event.get('kind')
+                    spike_frames = set(int(i) for i in flash_event.get('spike_frames') or [])
+
+                    kept = []
+                    for i in indices:
+                        if i in spike_frames:
+                            continue
+                        sig = self._flash_signal(i)
+                        if sig is None or baseline is None or amp <= 1e-6:
+                            kept.append(i)
+                            continue
+                        # Remove "afterglow" frames that are still far from baseline.
+                        if kind == 'bright':
+                            if float(sig) > float(baseline) + 0.40 * amp:
+                                continue
+                        elif kind == 'dark':
+                            if float(sig) < float(baseline) - 0.40 * amp:
+                                continue
+                        kept.append(i)
+                    return kept
+
+                # --- Cut features + decision ---
+
+                def _cut_features(self, cut_frame: int, window: int, total_frames: int, video_path: str = None):
+                    gap = max(2, int(max(3, window // 2)))
                     w_small = max(2, int(window))
                     w_large = int(min(max(w_small * 3, w_small + 2), self.MAX_LARGE_WINDOW))
 
-                    # Small + large windows
                     pre_s, post_s = self._window_indices(cut_frame, w_small, gap, total_frames)
                     pre_l, post_l = self._window_indices(cut_frame, w_large, gap, total_frames)
 
-                    # Adjacent frames right at the cut
                     pre_adj = cut_frame - 1
                     post_adj = cut_frame
 
@@ -934,162 +1403,199 @@ class SceneDetectApp:
                     pre_vecs_l = vecs_for(pre_l)
                     post_vecs_l = vecs_for(post_l)
 
-                    # Must have at least some evidence
                     if len(pre_vecs_s) < 2 or len(post_vecs_s) < 2:
                         return None
 
-                    s_small = self._pairwise_median_similarity(pre_vecs_s, post_vecs_s)
-
-                    # Large window may not be fully available near start/end
-                    s_large = None
+                    s_small_raw = self._pairwise_median_similarity(pre_vecs_s, post_vecs_s)
+                    s_large_raw = None
                     if len(pre_vecs_l) >= 2 and len(post_vecs_l) >= 2:
-                        s_large = self._pairwise_median_similarity(pre_vecs_l, post_vecs_l)
+                        s_large_raw = self._pairwise_median_similarity(pre_vecs_l, post_vecs_l)
 
-                    # Combine scales
-                    s_comb = float(s_small) if s_large is None else float(0.65 * s_small + 0.35 * s_large)
+                    s_comb_raw = float(s_small_raw) if s_large_raw is None else float(0.65 * s_small_raw + 0.35 * s_large_raw)
 
-                    # Adjacent similarity for discontinuity spike
                     s_adj = None
                     if pre_adj in self.cache and post_adj in self.cache:
                         s_adj = float((self.cache[pre_adj] * self.cache[post_adj]).sum().item())
 
-                    # Motion confidence (low adjacent similarity inside window => high motion)
-                    pre_motion = self._avg_adjacent_similarity(pre_vecs_s)
-                    post_motion = self._avg_adjacent_similarity(post_vecs_s)
-                    motion_score = float(max(0.0, 1.0 - 0.5 * (pre_motion + post_motion)))
+                    pre_cont = self._avg_adjacent_similarity(pre_vecs_s)
+                    post_cont = self._avg_adjacent_similarity(post_vecs_s)
+                    cont = float(min(pre_cont, post_cont))
+                    motion = float(max(0.0, 1.0 - cont))
 
-                    # Luma gating cues - Return-to-Baseline Flash Detection
-                    luma_prev = self.luma_cache.get(pre_adj)     # cut - 1
-                    luma_curr = self.luma_cache.get(post_adj)    # cut
-                    luma_next = self.luma_cache.get(post_adj + 1) # cut + 1
-                    
-                    flash = False
-                    near_black = False
-                    
-                    if luma_prev is not None and luma_curr is not None:
-                        # 1. Dark scene check
-                        near_black = (luma_prev <= self.NEAR_BLACK_LUMA) or (luma_curr <= self.NEAR_BLACK_LUMA)
-                        
-                        # 2. White Flash Check (High Abs Luma)
-                        is_white_flash = (
-                            (luma_prev > self.FLASH_HIGH_LUMA) != (luma_curr > self.FLASH_HIGH_LUMA)
-                        )
-                        
-                        # 3. Spike / Return-to-Baseline Check
-                        # We need luma_next to verify it's a spike, not a step.
-                        is_luma_spike = False
-                        if luma_next is not None:
-                            delta_rise = abs(luma_curr - luma_prev)
-                            delta_fall = abs(luma_next - luma_curr)
-                            delta_base = abs(luma_next - luma_prev)
-                            
-                            # It is a flash if:
-                            # A. The initial jump is significant (> threshold)
-                            # B. The 'return' jump is also significant
-                            # C. The baseline difference (prev vs next) is relatively small compared to the jump
-                            
-                            if delta_rise >= self.flash_luma_delta:
-                                # Check if it returns to similar level
-                                # "Stepped" change (cut) would have small delta_fall and large delta_base
-                                # "Spike" (flash) has large delta_fall and small delta_base
-                                
-                                # Heuristic: The fall must be at least 50% of the rise (or vice versa)
-                                # AND the baseline difference must be smaller than the jump.
-                                if delta_fall >= (delta_rise * 0.5):
-                                     is_luma_spike = True
-                        else:
-                            # Fallback if we are at the very last frame (cannot check next)
-                            # Just use simple delta
-                            is_luma_spike = abs(luma_curr - luma_prev) >= self.flash_luma_delta
-                            
-                        flash = is_white_flash or is_luma_spike
+                    flash_event = self._detect_flash_event(cut_frame, total_frames)
+
+                    s_sscd = None
+                    if (video_path is not None) and (getattr(self, 'sscd_model', None) is not None) and flash_event.get('is_flash', False):
+                        try:
+                            s_sscd = self._sscd_stable_similarity(video_path, cut_frame, total_frames, flash_event)
+                        except Exception as e:
+                            self._log.debug('SSCD similarity failed at cut@%d: %s', cut_frame, e)
+                            s_sscd = None
+
+
+                    s_small_stable = None
+                    s_large_stable = None
+                    s_comb_stable = None
+                    used_stable = False
+
+                    if flash_event.get('is_flash', False):
+                        used_stable = True
+                        pre_s_st = self._stable_indices(pre_s, flash_event)
+                        post_s_st = self._stable_indices(post_s, flash_event)
+                        pre_l_st = self._stable_indices(pre_l, flash_event)
+                        post_l_st = self._stable_indices(post_l, flash_event)
+
+                        pre_vecs_s_st = vecs_for(pre_s_st)
+                        post_vecs_s_st = vecs_for(post_s_st)
+                        if len(pre_vecs_s_st) >= 2 and len(post_vecs_s_st) >= 2:
+                            s_small_stable = self._pairwise_median_similarity(pre_vecs_s_st, post_vecs_s_st)
+
+                        pre_vecs_l_st = vecs_for(pre_l_st)
+                        post_vecs_l_st = vecs_for(post_l_st)
+                        if len(pre_vecs_l_st) >= 2 and len(post_vecs_l_st) >= 2:
+                            s_large_stable = self._pairwise_median_similarity(pre_vecs_l_st, post_vecs_l_st)
+
+                        if s_small_stable is not None:
+                            if s_large_stable is None:
+                                s_comb_stable = float(s_small_stable)
+                            else:
+                                s_comb_stable = float(0.65 * float(s_small_stable) + 0.35 * float(s_large_stable))
+
+                    if s_comb_stable is None:
+                        s_comb_stable = float(s_comb_raw)
+
+                    # Pixel cue on representative stable frames
+                    def get_hist(cands):
+                        for i in cands:
+                            if 0 <= i < total_frames and i in self.hist_cache:
+                                return self.hist_cache[i]
+                        return None
+
+                    # Prefer frames near the boundary but outside typical flash band
+                    pre_hist = get_hist([cut_frame - 4, cut_frame - 5, cut_frame - 3, cut_frame - 6])
+                    post_hist = get_hist([cut_frame + 4, cut_frame + 5, cut_frame + 3, cut_frame + 6])
+                    pixel_sim = self._hist_intersection(pre_hist, post_hist)
+                    if pixel_sim != pixel_sim:
+                        pixel_sim = None
 
                     return {
-                        "s_small": float(s_small),
-                        "s_large": None if s_large is None else float(s_large),
-                        "s_comb": float(s_comb),
-                        "s_adj": None if s_adj is None else float(s_adj),
-                        "motion": float(motion_score),
-                        "flash": bool(flash),
-                        "near_black": bool(near_black),
-                        "gap": int(gap),
-                        "w_small": int(w_small),
-                        "w_large": int(w_large),
+                        's_small_raw': float(s_small_raw),
+                        's_large_raw': None if s_large_raw is None else float(s_large_raw),
+                        's_comb_raw': float(s_comb_raw),
+                        's_small_stable': None if s_small_stable is None else float(s_small_stable),
+                        's_large_stable': None if s_large_stable is None else float(s_large_stable),
+                        's_comb_stable': float(s_comb_stable),
+                        's_sscd': None if s_sscd is None else float(s_sscd),
+                        's_adj': None if s_adj is None else float(s_adj),
+                        'pre_cont': float(pre_cont),
+                        'post_cont': float(post_cont),
+                        'cont': float(cont),
+                        'motion': float(motion),
+                        'pixel_sim': None if pixel_sim is None else float(pixel_sim),
+                        'used_stable': bool(used_stable),
+                        'flash': flash_event,
+                        'gap': int(gap),
+                        'w_small': int(w_small),
+                        'w_large': int(w_large),
                     }
 
-                def validate_cut(self, scene_index: int, cut_frame: int, window: int, total_frames: int, base_thr: float) -> bool:
-                    """Return True if it's a true cut (KEEP), False if likely a false-positive (MERGE)."""
-                    feats = self._cut_features(cut_frame, window, total_frames)
+                def validate_cut(self, scene_index: int, cut_frame: int, window: int, total_frames: int, base_thr: float, video_path: str = None) -> bool:
+                    """Return True if it is a true cut (KEEP), False if it should be merged (MERGE)."""
+                    feats = self._cut_features(cut_frame, window, total_frames, video_path=video_path)
                     if feats is None:
                         return True
 
-                    s_comb = feats["s_comb"]
-                    s_adj = feats["s_adj"]
-                    motion = feats["motion"]
-                    flash = feats["flash"]
-                    near_black = feats["near_black"]
+                    s_raw = float(feats['s_comb_raw'])
+                    s_stable = float(feats['s_comb_stable'])
+                    s_sscd = feats.get('s_sscd', None)
+                    s_adj = feats.get('s_adj')
+                    cont = float(feats.get('cont', 1.0))
+                    motion = float(feats.get('motion', 0.0))
+                    pixel_sim = feats.get('pixel_sim')
 
-                    # Dynamic threshold: motion & near-black make us *more conservative* about merging.
-                    thr = float(base_thr + self.MOTION_BOOST * motion + (self.BLACK_BOOST if near_black else 0.0))
-                    thr = float(min(max(thr, 0.80), 0.97))
+                    flash = feats.get('flash') or {}
+                    is_flash = bool(flash.get('is_flash', False))
+                    flash_conf = float(flash.get('conf', 0.0) or 0.0)
+                    flash_amp = float(flash.get('amp', 0.0) or 0.0)
+                    flash_dur = int(flash.get('dur', 0) or 0)
+                    flash_drift = flash.get('drift', None)
 
-                    # Safety Floor: Visual similarity must be at least 0.45 to merge
-                    safety_floor = 0.45
+                    decision_keep = True
+                    reason = 'default_keep'
 
-                    if s_comb < safety_floor:
-                         decision_keep = True
-                         reason = "safety_floor_violation"
-                    # Strong adjacent discontinuity almost always means a true cut.
-                    elif s_adj is not None and s_adj < self.ADJ_KEEP_CUTOFF:
-                        # Strong adjacent discontinuity almost always means a true cut.
-                        # Exception: Massive White Flash (which destroys embeddings)
-                        # We don't have flash_score anymore, but 'flash' is now more robust.
-                        # If it's a "Return to Baseline" flash, s_adj might be low because of the single flash frame.
-                        # But s_comb (surrounding window) should be high.
-                        
-                        # If flash is detected AND global similarity is high, we Override the Adjacency check.
-                        if flash and s_comb >= (thr - 0.05):
-                             decision_keep = False
-                             reason = "flash_override_adj"
+                    # 1) Flash override path: merge if stable similarity says "same shot"
+                    if is_flash:
+                        # Relative requirement adapts to motion; absolute floor prevents pathological merges.
+                        req_rel = max(self.MIN_STABLE_SIM, (1.05 * cont) - 0.15)  # ~cont-0.10 but slightly smoother
+                        req_abs = max(0.74, min(0.90, float(base_thr)) - 0.10 * motion)
+                        req_dino = float(max(req_rel, req_abs))
+
+                        # Prefer SSCD under flashes when available (more photometric invariant).
+                        sim_used = float(s_stable)
+                        sim_ok = (s_stable >= req_dino)
+                        helpful = (s_stable >= s_raw + 0.015) or (s_stable >= 0.90)
+                        pix_min = self.PIXEL_HIST_MIN
+                        min_flash_conf = 0.55
+
+                        if s_sscd is not None:
+                            try:
+                                req_sscd = self._sscd_required_sim(motion)
+                                sim_used = float(s_sscd)
+                                sim_ok = (float(s_sscd) >= req_sscd)
+                                helpful = True  # SSCD is evaluated on median-composited stable frames
+                                pix_min = 0.08
+                                min_flash_conf = 0.50
+                            except Exception:
+                                pass
+
+                        pix_ok = (pixel_sim is None) or (float(pixel_sim) >= pix_min)
+                        if flash_conf >= min_flash_conf and sim_ok and pix_ok and helpful:
+                            decision_keep = False
+                            reason = 'merge_flash'
                         else:
                             decision_keep = True
-                            reason = "adj_discontinuity"
-                    else:
-                        # Flash-like spike + high similarity => likely false positive.
-                        if flash and s_comb >= (thr - 0.10): # Relaxed threshold heavily for confirmed flashes
+                            reason = 'keep_flash_not_confident'
+
+                    # 2) Non-flash: strong adjacent discontinuity => KEEP
+                    if decision_keep and (s_adj is not None) and (float(s_adj) < self.ADJ_STRONG_CUT):
+                        decision_keep = True
+                        reason = 'adj_strong_cut'
+
+                    # 3) Non-flash false-positive merge path (fast motion / shaky camera):
+                    if decision_keep and (not is_flash):
+                        # Must be near within-shot continuity and above a conservative absolute threshold.
+                        req_rel = max(0.82, cont - 0.06)
+                        req_abs = max(0.86, min(0.92, float(base_thr)))
+                        req = float(max(req_rel, req_abs))
+
+                        pix_ok = (pixel_sim is not None and float(pixel_sim) >= self.PIXEL_HIST_STRONG)
+                        if (s_raw >= req) and pix_ok and ((s_adj is None) or float(s_adj) >= 0.78):
                             decision_keep = False
-                            reason = "flash_gate"
-                        else:
-                            # Default: merge only when similarity is clearly above threshold.
-                            if s_comb >= (thr + self.MERGE_MARGIN) and (s_adj is None or s_adj >= self.ADJ_MERGE_CUTOFF):
-                                # If near-black, require even more evidence.
-                                if near_black and s_comb < (thr + 0.03):
-                                    decision_keep = True
-                                    reason = "near_black_conservative"
-                                else:
-                                    decision_keep = False
-                                    reason = "high_similarity"
-                            else:
-                                decision_keep = True
-                                reason = "below_threshold"
+                            reason = 'merge_same_shot'
 
                     decision = (
                         f"{self.BOLD}{self.KEEP_FG}KEEP{self.RESET}"
                         if decision_keep
                         else f"{self.BOLD}{self.MERG_FG}MERGE{self.RESET}"
                     )
+
                     self._log.debug(
-                        "Scene #%d cut@%d | s_comb=%.3f (small=%.3f large=%s) s_adj=%s motion=%.2f thr=%.3f flash=%s black=%s -> %s (%s)",
+                        'Scene #%d cut@%d | s_raw=%.3f s_stable=%.3f s_sscd=%s s_adj=%s cont=%.3f motion=%.3f pixel=%s '
+                        'flash=%s(%.2f) amp=%.1f dur=%d drift=%s -> %s (%s)',
                         scene_index,
                         cut_frame,
-                        s_comb,
-                        feats["s_small"],
-                        "{:.3f}".format(feats["s_large"]) if feats["s_large"] is not None else "n/a",
-                        "{:.3f}".format(s_adj) if s_adj is not None else "n/a",
+                        s_raw,
+                        s_stable,
+                        '{:.3f}'.format(s_sscd) if s_sscd is not None else 'n/a',
+                        '{:.3f}'.format(s_adj) if s_adj is not None else 'n/a',
+                        cont,
                         motion,
-                        thr,
-                        str(flash),
-                        str(near_black),
+                        '{:.3f}'.format(pixel_sim) if pixel_sim is not None else 'n/a',
+                        'Y' if is_flash else 'N',
+                        flash_conf,
+                        flash_amp,
+                        flash_dur,
+                        '{:.1f}'.format(float(flash_drift)) if flash_drift is not None else 'n/a',
                         decision,
                         reason,
                     )
@@ -1107,10 +1613,9 @@ class SceneDetectApp:
                     cap.release()
 
                     if self.total_video_frames <= 0:
-                        self._log.warning("Could not determine frame count for AI validation; skipping.")
+                        self._log.warning('Could not determine frame count for AI validation; skipping.')
                         return scenes
 
-                    # Collect all unique frame indices required for all candidate cuts.
                     all_indices = set()
                     cut_frames = []
                     for _, end_tc in scenes[:-1]:
@@ -1118,28 +1623,21 @@ class SceneDetectApp:
                         cut_frames.append(cut)
 
                     w = int(window)
-                    gap = max(2, w)
+                    gap = max(2, int(max(3, w // 2)))
                     w_small = max(2, w)
                     w_large = int(min(max(w_small * 3, w_small + 2), self.MAX_LARGE_WINDOW))
 
                     for cut in cut_frames:
-                        # Adjacent frames at boundary
-                        all_indices.add(max(0, cut - 1))
-                        all_indices.add(min(self.total_video_frames - 1, cut))
-                        # Additional frame for "Return to Baseline" flash check (cut + 1)
-                        all_indices.add(min(self.total_video_frames - 1, cut + 1))
+                        # Flash analysis window
+                        for k in range(-self.FLASH_SCAN, self.FLASH_SCAN + 1):
+                            all_indices.add(max(0, min(self.total_video_frames - 1, cut + k)))
 
-                        # Small window (gapped)
                         pre_s, post_s = self._window_indices(cut, w_small, gap, self.total_video_frames)
-                        all_indices.update(pre_s)
-                        all_indices.update(post_s)
+                        all_indices.update(pre_s); all_indices.update(post_s)
 
-                        # Large window (gapped)
                         pre_l, post_l = self._window_indices(cut, w_large, gap, self.total_video_frames)
-                        all_indices.update(pre_l)
-                        all_indices.update(post_l)
+                        all_indices.update(pre_l); all_indices.update(post_l)
 
-                    # Embed once.
                     self._embed_all_required_frames(
                         video_path,
                         sorted(all_indices),
@@ -1147,26 +1645,24 @@ class SceneDetectApp:
                         progress_cb=progress_cb,
                     )
 
-                    # First pass: compute per-cut combined similarity for adaptive thresholding.
                     cut_scores = []
                     for i, cut in enumerate(cut_frames, start=1):
                         feats = self._cut_features(cut, w, self.total_video_frames)
                         if feats is None:
                             continue
-                        cut_scores.append(feats["s_comb"])
+                        cut_scores.append(float(feats['s_comb_raw']))
                         if progress_cb and i % 10 == 0:
-                            progress_cb(min(1.0, i / max(1, len(cut_frames))), f"Analyzing cut scores ({i}/{len(cut_frames)})")
+                            progress_cb(min(1.0, i / max(1, len(cut_frames))), f'Analyzing cut scores ({i}/{len(cut_frames)})')
 
                     base_thr = self._auto_threshold(cut_scores)
                     self._log.info(
-                        "AI validation adaptive threshold: base_thr=%.3f (window=%d, gap=%d, large=%d)",
+                        'AI validation adaptive same-shot threshold: base_thr=%.3f (window=%d, gap=%d, large=%d)',
                         base_thr,
                         w,
                         gap,
                         w_large,
                     )
 
-                    # Second pass: merge sequentially.
                     validated_scenes = []
                     cur_start, cur_end = scenes[0]
 
@@ -1183,6 +1679,7 @@ class SceneDetectApp:
                             window=w,
                             total_frames=self.total_video_frames,
                             base_thr=base_thr,
+                            video_path=video_path,
                         )
 
                         if keep_cut:
@@ -1192,10 +1689,26 @@ class SceneDetectApp:
                             cur_end = nxt_end
 
                         if progress_cb:
-                            progress_cb(min(1.0, i / max(1, len(scenes) - 1)), f"Validating cuts ({i}/{len(scenes) - 1})")
+                            progress_cb(min(1.0, i / max(1, len(scenes) - 1)), f'Validating cuts ({i}/{len(scenes) - 1})')
 
                     validated_scenes.append((cur_start, cur_end))
+
+                    # Release SSCD video handle (if used)
+                    try:
+                        if getattr(self, '_sscd_cap', None) is not None:
+                            self._sscd_cap.release()
+                    except Exception:
+                        pass
+                    self._sscd_cap = None
+                    self._sscd_video_path = None
+                    try:
+                        if getattr(self, '_sscd_frame_cache', None) is not None:
+                            self._sscd_frame_cache.clear()
+                    except Exception:
+                        pass
+
                     return validated_scenes
+
 
             validator = DinoCutValidator(
                 model_dir="./weights",
