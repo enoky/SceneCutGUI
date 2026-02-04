@@ -81,7 +81,7 @@ pip install opencv_contrib_python-4.13.0.90-cp37-abi3-win_amd64.whl
 
 ### 4. Download Model Weights
 
-Place the model checkpoints in the `weights/` directory:
+<a href="https://drive.google.com/file/d/1aJ96eJE4DstJ_HBzAusuYLvfU01Jnc92/view?usp=sharing">Download</a> the model checkpoints to the `weights/` directory:
 
 | File                             | Description                      |
 | -------------------------------- | -------------------------------- |
@@ -125,11 +125,11 @@ RUN_SceneCutGUI.bat
 
 ### Detection Parameters
 
-| Parameter       | Default | Description                                   |
-| --------------- | ------- | --------------------------------------------- |
-| `device`        | `auto`  | Compute device (`auto`, `cuda`, `cpu`, `mps`) |
+| Parameter       | Default                                 | Description                                   |
+| --------------- | --------------------------------------- | --------------------------------------------- |
+| `device`        | `auto`                                  | Compute device (`auto`, `cuda`, `cpu`, `mps`) |
 | `threshold`     | `0.296` (AutoShot) / `0.3` (TransNetV2) | Cut detection sensitivity (0–1)               |
-| `min_scene_len` | `8`     | Minimum scene length in frames                |
+| `min_scene_len` | `8`                                     | Minimum scene length in frames                |
 
 ### AI Validation (Optional)
 
