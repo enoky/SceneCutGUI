@@ -214,7 +214,7 @@ class SceneDetectApp:
         self.params_vars: dict = {}
         self.ai_validate_var = tk.BooleanVar(value=False)
         self.ai_window_var = tk.IntVar(value=5)
-        self.flash_sensitivity_var = tk.IntVar(value=30)  # Luma delta threshold for flash detection
+        self.flash_sensitivity_var = tk.IntVar(value=15)  # Luma delta threshold for flash detection
 
         # --- Output Action Variables ---
         self.export_csv_var = tk.BooleanVar(value=False)
@@ -409,7 +409,7 @@ class SceneDetectApp:
             
             self.ai_validate_var.set(settings.get("ai_validate", False))
             self.ai_window_var.set(settings.get("ai_window", 3))
-            self.flash_sensitivity_var.set(settings.get("flash_sensitivity", 30))
+            self.flash_sensitivity_var.set(settings.get("flash_sensitivity", 15))
             self.export_csv_var.set(settings.get("export_csv", False))
             self.export_html_var.set(settings.get("export_html", False))
             self.export_sc_var.set(settings.get("export_sc", False))
@@ -621,17 +621,6 @@ class SceneDetectApp:
             self.progress_queue.put((0, "Error."))
 
     def _run_ai_validation(self, video_path, scenes):
-        """Validate potential cuts using DINOv3 + practical heuristics.
-
-        Practical accuracy upgrades vs the original cosine(mean(pre), mean(post)) < 0.88:
-          - Sample *away* from the cut boundary (gap) to avoid blurred/dissolve frames.
-          - Multi-scale validation (small + large windows) to handle fades/fast motion.
-          - Robust similarity score: median pairwise similarity (pre x post), not mean vectors.
-          - Per-video adaptive merge threshold (Otsu + percentiles) instead of fixed 0.88.
-          - Flash + near-black gating and an adjacent-frame continuity check.
-
-        Returns a new scene list with likely false-positive cuts merged.
-        """
         try:
             import cv2
             import torch
@@ -639,20 +628,6 @@ class SceneDetectApp:
             from transformers import AutoImageProcessor, AutoModel
 
             class DinoCutValidator:
-                """
-                DINOv3-based cut validator with a flash-aware merge policy.
-
-                What this replaces:
-                  - The prior "prove flash or KEEP" policy that effectively never merged cuts. 
-
-                What this does instead (modern SBD practice):
-                  1) Detect transient *brightness outliers* around the boundary (flash / lightning / strobe / black-flash)
-                     using robust statistics (median + MAD) on a temporal window.
-                  2) Recompute cross-boundary similarity using "stable" frames that exclude the flash frames.
-                  3) Merge only when flash confidence is high AND stable-frame similarity indicates the same shot.
-                     (Adjacent-frame discontinuity is treated as strong cut evidence unless overridden by a flash event.)
-                """
-
                 # --- General ---
                 DEFAULT_BASE_THRESHOLD = 0.88
                 MAX_LARGE_WINDOW = 24
@@ -670,7 +645,7 @@ class SceneDetectApp:
                 FLASH_BASE_GAP = 5      # baseline windows start beyond this offset from the cut
 
                 FLASH_MIN_DUR = 1
-                FLASH_MAX_DUR = 6
+                FLASH_MAX_DUR = 8
 
                 # --- Pixel cue (HSV H,S histogram intersection in [0,1]) ---
                 PIXEL_HIST_MIN = 0.08
@@ -719,10 +694,7 @@ class SceneDetectApp:
                     # User sensitivity knob: smaller -> more sensitive (merge more flash cuts)
                     self.flash_luma_delta = float(flash_luma_delta)
 
-                    # Precompute normalization tensors
-                    import torch
-                    self._mean = torch.tensor(self.processor.image_mean, device=self.device).view(1, 3, 1, 1)
-                    self._std = torch.tensor(self.processor.image_std, device=self.device).view(1, 3, 1, 1)
+                    # Rely on the HF image processor for rescale + normalize.
                     # ---- Optional SSCD (photometric-invariant descriptor) ----
                     self.sscd_model = None
                     self.sscd_input = int(sscd_input)
@@ -804,12 +776,14 @@ class SceneDetectApp:
                         return float(l)
                     return float(max(float(l), float(v)))
 
-                def _embed_batch(self, images_tensor):
+                def _embed_batch(self, pixel_values):
                     import torch
                     with torch.inference_mode():
-                        images_tensor = (images_tensor / 255.0 - self._mean) / self._std
-                        outputs = self.model(pixel_values=images_tensor)
-                        pooled = outputs.pooler_output
+                        outputs = self.model(pixel_values=pixel_values)
+                        pooled = getattr(outputs, 'pooler_output', None)
+                        if pooled is None:
+                            # Fallback to CLS token if pooler_output is unavailable.
+                            pooled = outputs.last_hidden_state[:, 0]
                         return torch.nn.functional.normalize(pooled, dim=-1)
 
                 # ---- SSCD helpers (optional) ----
@@ -1030,7 +1004,7 @@ class SceneDetectApp:
                     indices_set = set(indices)
 
                     target_size = self._target_size()
-                    batch, batch_ids = [], []
+                    batch_imgs, batch_ids = [], []
 
                     use_cuda_decode = True
                     try:
@@ -1042,14 +1016,20 @@ class SceneDetectApp:
                         cap = cv2.VideoCapture(video_path)
 
                     def flush_batch():
-                        nonlocal batch, batch_ids
-                        if not batch:
+                        nonlocal batch_imgs, batch_ids
+                        if not batch_imgs:
                             return
-                        images = torch.stack(batch, dim=0)
-                        embeddings = self._embed_batch(images)
+                        inputs = self.processor(
+                            images=batch_imgs,
+                            return_tensors='pt',
+                            do_resize=False,
+                            do_center_crop=False,
+                        )
+                        pixel_values = inputs['pixel_values'].to(self.device)
+                        embeddings = self._embed_batch(pixel_values)
                         for j, fid in enumerate(batch_ids):
                             self.cache[fid] = embeddings[j]
-                        batch, batch_ids = [], []
+                        batch_imgs, batch_ids = [], []
 
                     frame_idx = 0
                     wanted_i = 0
@@ -1086,9 +1066,7 @@ class SceneDetectApp:
                                 self.vhi_cache[frame_idx] = v_hi
                                 self.hist_cache[frame_idx] = hist
 
-                                t = torch.as_tensor(rgb, device=self.device)
-                                t = t.permute(2, 0, 1).contiguous().float()
-                                batch.append(t)
+                                batch_imgs.append(rgb)
                                 batch_ids.append(frame_idx)
                                 wanted_i += 1
                         else:
@@ -1107,13 +1085,11 @@ class SceneDetectApp:
                                 self.vhi_cache[frame_idx] = v_hi
                                 self.hist_cache[frame_idx] = hist
 
-                                t = torch.from_numpy(rgb).to(self.device)
-                                t = t.permute(2, 0, 1).contiguous().float()
-                                batch.append(t)
+                                batch_imgs.append(rgb)
                                 batch_ids.append(frame_idx)
                                 wanted_i += 1
 
-                        if len(batch) >= self.batch_size:
+                        if len(batch_imgs) >= self.batch_size:
                             flush_batch()
 
                         if progress_cb and total_wanted > 0 and frame_idx % 50 == 0:
@@ -1123,8 +1099,11 @@ class SceneDetectApp:
 
                     flush_batch()
 
-                    if not use_cuda_decode:
-                        cap.release()
+                    try:
+                        if hasattr(cap, 'release'):
+                            cap.release()
+                    except Exception:
+                        pass
 
                     self._log.info('Frame embedding complete (%d cached).', len(self.cache))
 
@@ -1306,8 +1285,11 @@ class SceneDetectApp:
                         dur_score = 0.0
                     elif dur <= 3:
                         dur_score = 1.0
+                    elif dur <= 6:
+                        dur_score = 0.85
                     elif dur <= self.FLASH_MAX_DUR:
-                        dur_score = 0.75
+                        # Longer flashes are still valid; give a slightly lower but positive weight.
+                        dur_score = 0.70
                     else:
                         dur_score = 0.0
 
@@ -1324,7 +1306,7 @@ class SceneDetectApp:
                         else:
                             return_score = 0.0
 
-                    conf = float(np.clip(0.55 * amp_score + 0.15 * z_score + 0.15 * dur_score + 0.15 * return_score, 0.0, 1.0))
+                    conf = float(np.clip(0.52 * amp_score + 0.15 * z_score + 0.18 * dur_score + 0.15 * return_score, 0.0, 1.0))
                     if not boundary_hit:
                         conf *= 0.5
 
@@ -1522,47 +1504,142 @@ class SceneDetectApp:
 
                     decision_keep = True
                     reason = 'default_keep'
+                    sscd_decision_lock = False
 
-                    # 1) Flash override path: merge if stable similarity says "same shot"
+                    ambiguous_non_flash = False
+                    high_sim_non_flash = False
+                    if not is_flash:
+                        # Ambiguous when DINO is near threshold or cues disagree (loosened).
+                        near_thr = abs(float(s_raw) - float(base_thr)) <= 0.10
+                        adj_amb = (s_adj is not None) and (0.60 <= float(s_adj) <= 0.90) and (float(s_raw) >= float(base_thr) - 0.08)
+                        pix_amb = (
+                            (pixel_sim is None)
+                            or (float(pixel_sim) < (self.PIXEL_HIST_STRONG + 0.04))
+                        )
+                        mot_amb = (float(motion) >= 0.20) and (float(s_raw) >= float(base_thr) - 0.08)
+                        high_sim_non_flash = float(s_raw) >= float(base_thr) + 0.01
+                        ambiguous_non_flash = bool(near_thr or adj_amb or pix_amb or mot_amb or high_sim_non_flash)
+
+                    # Evaluate SSCD for flash cuts or ambiguous/high-sim non-flash cuts.
+                    if (s_sscd is None) and (video_path is not None) and (getattr(self, 'sscd_model', None) is not None):
+                        if is_flash or ambiguous_non_flash or high_sim_non_flash:
+                            try:
+                                s_sscd = self._sscd_stable_similarity(video_path, cut_frame, total_frames, flash)
+                            except Exception as e:
+                                self._log.debug('SSCD similarity failed at cut@%d: %s', cut_frame, e)
+                                s_sscd = None
+                            feats['s_sscd'] = None if s_sscd is None else float(s_sscd)
+
+                    # 1) Flash path: default MERGE on confident flash unless strong cut evidence exists.
                     if is_flash:
-                        # Relative requirement adapts to motion; absolute floor prevents pathological merges.
-                        req_rel = max(self.MIN_STABLE_SIM, (1.05 * cont) - 0.15)  # ~cont-0.10 but slightly smoother
-                        req_abs = max(0.74, min(0.90, float(base_thr)) - 0.10 * motion)
-                        req_dino = float(max(req_rel, req_abs))
+                        # Lower confidence threshold to favor merging flashes.
+                        min_flash_conf = 0.40
+                        if s_sscd is not None:
+                            min_flash_conf = 0.35
 
-                        # Prefer SSCD under flashes when available (more photometric invariant).
-                        sim_used = float(s_stable)
-                        sim_ok = (s_stable >= req_dino)
-                        helpful = (s_stable >= s_raw + 0.015) or (s_stable >= 0.90)
-                        pix_min = self.PIXEL_HIST_MIN
-                        min_flash_conf = 0.55
+                        # Strong cut evidence overrides flash-merge default, but be very conservative.
+                        low_cut_thr = max(0.48, min(0.64, float(base_thr) - 0.26 - 0.12 * motion))
+                        s_cut = float(min(s_raw, s_stable))
+                        strong_signals = 0
 
+                        if (s_adj is not None) and (float(s_adj) < (self.ADJ_STRONG_CUT - 0.12)):
+                            strong_signals += 1
+                        if s_cut < low_cut_thr:
+                            strong_signals += 1
+                        if (pixel_sim is not None) and (float(pixel_sim) < 0.025):
+                            strong_signals += 1
                         if s_sscd is not None:
                             try:
-                                req_sscd = self._sscd_required_sim(motion)
-                                sim_used = float(s_sscd)
-                                sim_ok = (float(s_sscd) >= req_sscd)
-                                helpful = True  # SSCD is evaluated on median-composited stable frames
-                                pix_min = 0.08
-                                min_flash_conf = 0.50
+                                if float(s_sscd) < 0.55:
+                                    strong_signals += 1
                             except Exception:
                                 pass
 
-                        pix_ok = (pixel_sim is None) or (float(pixel_sim) >= pix_min)
-                        if flash_conf >= min_flash_conf and sim_ok and pix_ok and helpful:
-                            decision_keep = False
-                            reason = 'merge_flash'
+                        # Require multiple strong indicators before keeping a flash cut.
+                        strong_cut = (strong_signals >= 3) or (
+                            (s_adj is not None and float(s_adj) < (self.ADJ_STRONG_CUT - 0.20))
+                        ) or (s_cut < (low_cut_thr - 0.10))
+
+                        if flash_conf >= min_flash_conf:
+                            if strong_cut:
+                                decision_keep = True
+                                reason = 'keep_flash_strong_cut'
+                            else:
+                                decision_keep = False
+                                reason = 'merge_flash_default'
                         else:
                             decision_keep = True
-                            reason = 'keep_flash_not_confident'
+                            reason = 'keep_flash_low_conf'
 
-                    # 2) Non-flash: strong adjacent discontinuity => KEEP
-                    if decision_keep and (s_adj is not None) and (float(s_adj) < self.ADJ_STRONG_CUT):
+                    # 2) Non-flash ambiguous/high-sim: use SSCD as tie-breaker
+                    if decision_keep and (not is_flash) and (ambiguous_non_flash or high_sim_non_flash) and (s_sscd is not None):
+                        try:
+                            req_sscd = float(max(0.62, min(0.84, self._sscd_required_sim(motion) - 0.04)))
+                            if float(s_sscd) >= req_sscd:
+                                decision_keep = False
+                                reason = 'merge_same_shot_sscd'
+                                sscd_decision_lock = True
+                            elif float(s_sscd) <= (req_sscd - 0.10):
+                                # Only keep if multiple cues indicate a real cut.
+                                cut_like = 0
+                                if (s_adj is not None) and (float(s_adj) < 0.76):
+                                    cut_like += 1
+                                if cont < 0.84:
+                                    cut_like += 1
+                                if (pixel_sim is not None) and (float(pixel_sim) < 0.06):
+                                    cut_like += 1
+                                if s_raw < (float(base_thr) - 0.10):
+                                    cut_like += 1
+                                if cut_like >= 2:
+                                    decision_keep = True
+                                    reason = 'keep_cut_sscd'
+                                    sscd_decision_lock = True
+                        except Exception:
+                            pass
+
+                    # 2b) Non-flash moderate continuity merge: reduce false keeps
+                    if decision_keep and (not is_flash) and (not sscd_decision_lock):
+                        mid_cont = (
+                            (cont >= 0.87)
+                            and ((s_adj is None) or (float(s_adj) >= 0.83))
+                            and (s_raw >= (float(base_thr) - 0.18))
+                            and ((pixel_sim is None) or (float(pixel_sim) >= 0.10))
+                        )
+                        if mid_cont:
+                            decision_keep = False
+                            reason = 'merge_same_shot_continuity_mid'
+                        else:
+                            # High pixel similarity can override lower s_raw when continuity is strong.
+                            hi_pix_merge = (
+                                (pixel_sim is not None)
+                                and (float(pixel_sim) >= 0.16)
+                                and (cont >= 0.85)
+                                and ((s_adj is None) or (float(s_adj) >= 0.80))
+                                and (s_raw >= (float(base_thr) - 0.26))
+                            )
+                            if hi_pix_merge:
+                                decision_keep = False
+                                reason = 'merge_same_shot_pixel'
+
+                    # 2c) Non-flash high-continuity merge: reduce false keeps
+                    if decision_keep and (not is_flash):
+                        high_cont = (
+                            (cont >= 0.90)
+                            and ((s_adj is None) or (float(s_adj) >= 0.88))
+                            and (s_raw >= (float(base_thr) - 0.12))
+                            and ((pixel_sim is None) or (float(pixel_sim) >= 0.10))
+                        )
+                        if high_cont:
+                            decision_keep = False
+                            reason = 'merge_same_shot_continuity'
+
+                    # 3) Non-flash: strong adjacent discontinuity => KEEP (unless SSCD decided)
+                    if (not sscd_decision_lock) and decision_keep and (s_adj is not None) and (float(s_adj) < self.ADJ_STRONG_CUT):
                         decision_keep = True
                         reason = 'adj_strong_cut'
 
-                    # 3) Non-flash false-positive merge path (fast motion / shaky camera):
-                    if decision_keep and (not is_flash):
+                    # 4) Non-flash false-positive merge path (fast motion / shaky camera):
+                    if decision_keep and (not is_flash) and (not sscd_decision_lock):
                         # Must be near within-shot continuity and above a conservative absolute threshold.
                         req_rel = max(0.82, cont - 0.06)
                         req_abs = max(0.86, min(0.92, float(base_thr)))
