@@ -11,7 +11,7 @@ A modern, GPU-accelerated scene detection and video slicing tool with an intuiti
 ## ✨ Features
 
 - **TransNetV2 Detection** — State-of-the-art neural network for shot boundary detection
-- **DINOv3 AI Validation** — Optional post-processing to filter out flashes, fast motion, and near-black false positives
+- **DINOv3/SSCD AI Validation** — Optional post-processing to filter out flashes, fast motion, and near-black false positives
 - **GPU Acceleration** — CUDA support for both video decoding (OpenCV) and model inference (PyTorch)
 - **Multiple Export Formats**:
   - CSV scene list
@@ -73,6 +73,7 @@ pip install -r requirements.txt
 > [opencv-python-cuda-wheels](https://github.com/cudawarped/opencv-python-cuda-wheels/releases)
 
 Install OpenCV with CUDA support command example:
+
 ```bash
 pip install opencv_contrib_python-4.13.0.90-cp37-abi3-win_amd64.whl
 ```
@@ -81,13 +82,13 @@ pip install opencv_contrib_python-4.13.0.90-cp37-abi3-win_amd64.whl
 
 <a href="https://drive.google.com/file/d/1aJ96eJE4DstJ_HBzAusuYLvfU01Jnc92/view?usp=sharing">Download Model Weights</a> and place them in the `weights/` directory:
 
-| File | Description |
-|------|-------------|
-| `transnetv2-pytorch-weights.pth` | TransNetV2 model weights |
-| `model.safetensors` | DINOv3 model (for AI validation) |
-| `config.json` | DINOv3 model config |
-| `preprocessor_config.json` | DINOv3 preprocessor config |
-| `sscd_disc_large.torchscript.pt` | SSCD model (for AI validation) |
+| File                             | Description                      |
+| -------------------------------- | -------------------------------- |
+| `transnetv2-pytorch-weights.pth` | TransNetV2 model weights         |
+| `model.safetensors`              | DINOv3 model (for AI validation) |
+| `config.json`                    | DINOv3 model config              |
+| `preprocessor_config.json`       | DINOv3 preprocessor config       |
+| `sscd_disc_large.torchscript.pt` | SSCD model (for AI validation)   |
 
 ---
 
@@ -122,48 +123,51 @@ RUN_SceneCutGUI.bat
 
 ### Detection Parameters
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `device` | `auto` | Compute device (`auto`, `cuda`, `cpu`, `mps`) |
-| `threshold` | `0.5` | Cut detection sensitivity (0–1) |
-| `min_scene_len` | `8` | Minimum scene length in frames |
+| Parameter       | Default | Description                                   |
+| --------------- | ------- | --------------------------------------------- |
+| `device`        | `auto`  | Compute device (`auto`, `cuda`, `cpu`, `mps`) |
+| `threshold`     | `0.5`   | Cut detection sensitivity (0–1)               |
+| `min_scene_len` | `8`     | Minimum scene length in frames                |
 
 ### AI Validation (Optional)
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `ai_validate` | `false` | Enable DINOv3 validation |
-| `ai_window` | `3` | Frames before/after cut to analyze |
+| Parameter     | Default | Description                        |
+| ------------- | ------- | ---------------------------------- |
+| `ai_validate` | `false` | Enable DINOv3 validation           |
+| `ai_window`   | `3`     | Frames before/after cut to analyze |
 
 ### FFmpeg Output Settings
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `ffmpeg_codec` | `h264_nvenc` | Video codec (`h264_nvenc`, `hevc_nvenc`, `libx264`) |
-| `ffmpeg_preset` | `p7` | NVENC quality preset (p1=fastest, p7=best) |
-| `ffmpeg_cq` | `16` | Constant quality level (lower=better) |
+| Parameter       | Default      | Description                                         |
+| --------------- | ------------ | --------------------------------------------------- |
+| `ffmpeg_codec`  | `h264_nvenc` | Video codec (`h264_nvenc`, `hevc_nvenc`, `libx264`) |
+| `ffmpeg_preset` | `p7`         | NVENC quality preset (p1=fastest, p7=best)          |
+| `ffmpeg_cq`     | `16`         | Constant quality level (lower=better)               |
 
 ---
 
 ## 📁 Output Formats
 
-| Format | Extension | Description |
-|--------|-----------|-------------|
-| **CSV** | `.csv` | Scene list with timecodes and frame numbers |
-| **HTML** | `.html` | Visual report with scene table |
-| **SC File** | `.sc` | DaVinci Resolve scene cut format |
-| **Images** | `.jpg` | Thumbnail frames per scene |
-| **Video Clips** | `.mp4` | Split video per scene (via FFmpeg) |
+| Format          | Extension | Description                                 |
+| --------------- | --------- | ------------------------------------------- |
+| **CSV**         | `.csv`    | Scene list with timecodes and frame numbers |
+| **HTML**        | `.html`   | Visual report with scene table              |
+| **SC File**     | `.sc`     | DaVinci Resolve scene cut format            |
+| **Images**      | `.jpg`    | Thumbnail frames per scene                  |
+| **Video Clips** | `.mp4`    | Split video per scene (via FFmpeg)          |
 
 ---
 
 ## 🧠 How It Works
 
 ### TransNetV2 Detection
+
 TransNetV2 is a deep learning model specifically trained for shot boundary detection. It processes video frames and outputs probability scores for each frame being a scene transition.
 
 ### DINOv3 AI Validation
+
 The optional validation step uses a DINOv3 vision transformer to:
+
 - Sample frames before and after each detected cut
 - Compute visual embeddings and similarity scores
 - Filter out false positives (flashes, fast motion, near-black frames)
