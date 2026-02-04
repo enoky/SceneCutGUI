@@ -312,7 +312,7 @@ class SceneDetectApp:
         # --- AI Validation Frame ---
         ai_frame = ttk.LabelFrame(main_frame, text="Optional: AI Validation")
         ai_frame.pack(fill=tk.X, padx=5, pady=5)
-        ai_check = ttk.Checkbutton(ai_frame, text="Validate cuts with DINOv3 (filters flashes/fast motion)", variable=self.ai_validate_var)
+        ai_check = ttk.Checkbutton(ai_frame, text="Validate cuts with DINOv3/SSCD (filters flashes/fast motion)", variable=self.ai_validate_var)
         ai_check.grid(row=0, column=0, columnspan=3, padx=5, pady=5, sticky="w")
         self._attach_tooltip(ai_check, "ai_validate")
         ttk.Label(ai_frame, text="Validation Window (frames):").grid(row=1, column=0, padx=5, pady=5, sticky="w")
@@ -645,7 +645,7 @@ class SceneDetectApp:
                 FLASH_BASE_GAP = 5      # baseline windows start beyond this offset from the cut
 
                 FLASH_MIN_DUR = 1
-                FLASH_MAX_DUR = 8
+                FLASH_MAX_DUR = 9
 
                 # --- Pixel cue (HSV H,S histogram intersection in [0,1]) ---
                 PIXEL_HIST_MIN = 0.08
