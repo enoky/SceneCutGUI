@@ -471,7 +471,7 @@ class SceneDetectApp:
 
         # Row 1: threshold
         ttk.Label(self.params_frame, text="threshold:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
-        t_var = tk.StringVar(value="0.5")
+        t_var = tk.StringVar(value="0.3")
         t_entry = ttk.Entry(self.params_frame, textvariable=t_var, width=10)
         t_entry.grid(row=1, column=1, padx=5, pady=2, sticky="w")
         self._attach_tooltip(t_entry, "threshold")
@@ -562,7 +562,7 @@ class SceneDetectApp:
 
             self.progress_queue.put((20, "Running TransNetV2 inference..."))
             with torch.no_grad():
-                tn_scenes = model.detect_scenes(video_path, threshold=float(detector.get("threshold", 0.5)))
+                tn_scenes = model.detect_scenes(video_path, threshold=float(detector.get("threshold", 0.3)))
 
             if self.abort_flag.is_set():
                 raise InterruptedError
