@@ -42,7 +42,7 @@ TOOLTIPS: dict[str, str] = {
     # AI Validation
     "ai_validate": "Use a DINOv3 model to validate cuts and filter out flashes/fast motion. Requires a CUDA-enabled GPU.",
     "ai_window": "Number of frames before and after a cut to analyze for AI validation.",
-    "flash_sensitivity": "Sensitivity for detecting flash spikes versus scene cuts. Lower values (15-25) detect flashes more aggressively. Default: 30.",
+    "flash_sensitivity": "Sensitivity for detecting flash spikes versus scene cuts. Lower values (15-25) detect flashes more aggressively. Default: 15.",
     
     # Output and statistics
     "stats_enabled": "Enable logging of detection metrics to a CSV file.",
