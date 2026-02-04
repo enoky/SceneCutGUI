@@ -200,6 +200,9 @@ def transnetv2_scenes_to_timecodes(
     """Convert TransNetV2 output dicts into [(start_tc, end_tc_excl), ...]."""
     scenes_out: list[tuple[Timecode, Timecode]] = []
 
+    # Sort by start frame to be safe
+    tn_scenes.sort(key=lambda x: int(x.get("start_frame", 0)) if "start_frame" in x else float(x.get("start_time", 0.0)))
+    
     last_end = 0
     for s in tn_scenes:
         if isinstance(s, dict) and "start_frame" in s and "end_frame" in s:
@@ -213,9 +216,30 @@ def transnetv2_scenes_to_timecodes(
 
         start_f = max(0, min(start_f, total_frames))
         end_f = max(start_f + 1, min(end_f, total_frames))
-
-        # Make monotonic / non-overlapping
-        start_f = max(start_f, last_end)
+        
+        # Enforce continuity: 
+        # If there is a gap between last_end and this start_f, the gap is likely a transition.
+        # We can either:
+        # 1. Extend previous scene to start_f (last_end -> start_f)
+        # 2. Start this scene at last_end (start_f -> last_end)
+        # 3. Split the gap.
+        #
+        # Simple robust approach: "Scene ends where next starts".
+        # So we fix PREVIOUS scene's end to be CURRENT scene's start.
+        
+        if scenes_out:
+            prev_start_tc, _ = scenes_out[-1]
+            # Update previous scene end to meet current start
+            # But ensure we don't shrink it to zero/negative
+            new_prev_end = max(prev_start_tc.get_frames() + 1, start_f)
+            scenes_out[-1] = (prev_start_tc, Timecode(new_prev_end, fps))
+            
+            # Now current scene starts exactly where previous ended
+            start_f = new_prev_end
+        else:
+            # First scene always starts at 0
+            start_f = 0
+            
         end_f = max(end_f, start_f + 1)
         last_end = end_f
 
@@ -272,75 +296,80 @@ def _autoshot_load_model(weights_path: str, device: str):
     return model, device
 
 
-def _autoshot_get_frames(video_path: str, width: int = 48, height: int = 27):
+def _autoshot_frame_generator(video_path: str, width: int = 48, height: int = 27):
     import numpy as np
-
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    cmd = [
-        "ffmpeg",
-        "-v",
-        "error",
-        "-i",
-        video_path,
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-s",
-        f"{width}x{height}",
-        "-",
-    ]
-    result = subprocess.run(cmd, capture_output=True, check=False, creationflags=creationflags)
-    if result.returncode != 0:
-        err = (result.stderr or b"").decode("utf-8", errors="ignore")
-        raise RuntimeError(f"FFmpeg failed to decode frames: {err.strip()}")
-
-    raw = result.stdout or b""
+    
     frame_size = width * height * 3
-    if len(raw) < frame_size:
-        raise RuntimeError("FFmpeg returned no frames for AutoShot inference.")
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", video_path,
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{width}x{height}", "-"
+    ]
+    
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags=creationflags
+    )
+    
+    try:
+        while True:
+            # Read a chunk of frames to reduce overhead (50 frames ~ 200KB)
+            chunk_size = 50 * frame_size 
+            raw = process.stdout.read(chunk_size)
+            if not raw:
+                break
+                
+            n_bytes = len(raw)
+            n_frames = n_bytes // frame_size
+            if n_frames == 0:
+                break 
+                
+            frames = np.frombuffer(raw[:n_frames*frame_size], dtype=np.uint8).reshape((n_frames, height, width, 3))
+            yield frames
+            
+            if n_bytes < chunk_size:
+                break
+    except Exception as e:
+        logger.error(f"FFmpeg streaming error: {e}")
+        raise
+    finally:
+        if process.stdout: process.stdout.close()
+        if process.stderr: process.stderr.close()
+        process.wait()
 
-    frame_count = len(raw) // frame_size
-    raw = raw[: frame_count * frame_size]
-    frames = np.frombuffer(raw, np.uint8).reshape((frame_count, height, width, 3))
-    return frames
 
 
-def _autoshot_get_batches(frames):
+
+def _find_peak_cuts(predictions: list, threshold: float) -> list[int]:
+    """Find local maxima (peaks) in contiguous regions above threshold."""
     import numpy as np
-
-    remainder = 50 - len(frames) % 50
-    if remainder == 50:
-        remainder = 0
-    frames = np.concatenate([frames[:1]] * 25 + [frames] + [frames[-1:]] * (remainder + 25), 0)
-
-    for i in range(0, len(frames) - 50, 50):
-        yield frames[i : i + 100]
-
-
-def _autoshot_predictions_to_scenes(predictions):
-    import numpy as np
-
+    
     pred = np.asarray(predictions).reshape(-1)
-    pred = pred.astype(np.uint8)
-    scenes = []
-    t_prev, start = 0, 0
-    t = 0
-    for i, t in enumerate(pred):
-        t = int(t)
-        if t_prev == 1 and t == 0:
-            start = i
-        if t_prev == 0 and t == 1 and i != 0:
-            scenes.append([start, i])
-        t_prev = t
-
-    if len(pred) > 0 and t == 0:
-        scenes.append([start, len(pred) - 1])
-
-    if len(scenes) == 0 and len(pred) > 0:
-        scenes = [[0, len(pred) - 1]]
-
-    return np.array(scenes, dtype=np.int32)
+    # Identify regions above threshold
+    is_candidate = (pred > threshold).astype(np.int32)
+    
+    # Pad to handle edge cases
+    padded = np.pad(is_candidate, (1, 1), mode='constant', constant_values=0)
+    diff = np.diff(padded)
+    
+    # Start and end indices of candidate regions
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    
+    cuts = []
+    for s, e in zip(starts, ends):
+        # Look at the original predictions in this range [s, e)
+        # We need the relative index of max value within the slice
+        region = pred[s:e]
+        if len(region) == 0: continue
+            
+        peak_idx = np.argmax(region)
+        # The absolute frame index of the cut
+        cut_frame = s + peak_idx
+        cuts.append(cut_frame)
+        
+    return cuts
 
 
 def autoshot_predictions_to_timecodes(
@@ -350,71 +379,130 @@ def autoshot_predictions_to_timecodes(
     threshold: float,
 ) -> list[tuple[Timecode, Timecode]]:
     import numpy as np
-
+    
     pred = np.asarray(predictions).reshape(-1)
     if total_frames <= 0:
         total_frames = len(pred)
+        
+    # Ensure prediction array matches total_frames length
     if len(pred) < total_frames:
         pred = np.pad(pred, (0, total_frames - len(pred)), mode="constant", constant_values=0)
     pred = pred[:total_frames]
 
-    binary = (pred > float(threshold)).astype(np.uint8)
-    scenes = _autoshot_predictions_to_scenes(binary)
-
+    # Find peaks to determine exact cut locations
+    cut_frames = _find_peak_cuts(pred, threshold)
+    
+    # Construct contiguous scenes from cuts
+    # Format: [0, cut1), [cut1, cut2), ... [cutN, total_frames)
+    scene_boundaries = [0] + sorted(cut_frames)
+    
+    # Ensure the last boundary is total_frames if not already
+    # If the last cut was somehow at total_frames, we don't want a 0-length scene
+    if scene_boundaries[-1] >= total_frames:
+        scene_boundaries[-1] = total_frames 
+    else:
+        scene_boundaries.append(total_frames)
+        
+    # Filter unique (in case 0 was a cut) and sort
+    scene_boundaries = sorted(list(set(scene_boundaries)))
+    
     scenes_out: list[tuple[Timecode, Timecode]] = []
-    last_end = 0
-    for start_f, end_f_incl in scenes:
-        start_f = int(start_f)
-        end_f_excl = int(end_f_incl) + 1
-
-        start_f = max(0, min(start_f, total_frames))
-        end_f_excl = max(start_f + 1, min(end_f_excl, total_frames))
-
-        start_f = max(start_f, last_end)
-        end_f_excl = max(end_f_excl, start_f + 1)
-        last_end = end_f_excl
-
-        scenes_out.append((Timecode(start_f, fps), Timecode(end_f_excl, fps)))
-
-    if scenes_out and scenes_out[-1][1].get_frames() < total_frames:
-        scenes_out[-1] = (scenes_out[-1][0], Timecode(total_frames, fps))
-
-    if not scenes_out and total_frames > 0:
-        scenes_out = [(Timecode(0, fps), Timecode(total_frames, fps))]
-
+    
+    for i in range(len(scene_boundaries) - 1):
+        start_f = scene_boundaries[i]
+        end_f = scene_boundaries[i+1]
+        
+        # Skip empty scenes (though set/sorted should prevent this unless total_frames=0)
+        if end_f <= start_f:
+            continue
+            
+        scenes_out.append((Timecode(start_f, fps), Timecode(end_f, fps)))
+        
     return scenes_out
 
 
-def _autoshot_predict_from_frames(frames, model, device, abort_flag=None, progress_cb=None):
+def _autoshot_predict_from_stream(frame_gen, model, device, total_frames_est=None, abort_flag=None, progress_cb=None):
     import numpy as np
-
-    if frames is None or len(frames) == 0:
-        raise RuntimeError("AutoShot received no frames for inference.")
-
-    num_batches = max(1, (len(frames) + 49) // 50)
+    
+    buffer = [] 
     predictions = []
-
+    
+    real_frames_count = 0
+    first_frame_seen = False
+    
     with torch.no_grad():
-        for idx, batch in enumerate(_autoshot_get_batches(frames)):
-            if abort_flag is not None and abort_flag.is_set():
+        for chunk in frame_gen:
+            if abort_flag and abort_flag.is_set():
                 raise InterruptedError
+            
+            # Convert chunk (N,H,W,C) to list of frames
+            # Using list of arrays is flexible
+            frames_list = list(chunk)
+            chunk_len = len(frames_list)
+            real_frames_count += chunk_len
+            
+            if not first_frame_seen and chunk_len > 0:
+                 # Pre-pad with 25 copies of start
+                 buffer.extend([frames_list[0]] * 25)
+                 first_frame_seen = True
+            
+            buffer.extend(frames_list)
+            
+            # Process complete batches (sliding window)
+            while len(buffer) >= 100:
+                if abort_flag and abort_flag.is_set():
+                    raise InterruptedError
+                    
+                batch_frames = buffer[:100]
+                batch_np = np.stack(batch_frames)
+                
+                batch_t = torch.from_numpy(
+                    batch_np.transpose((3, 0, 1, 2))[np.newaxis, ...]
+                ).float().to(device)
+                
+                one_hot = model(batch_t)
+                if isinstance(one_hot, tuple): one_hot = one_hot[0]
+                one_hot = torch.sigmoid(one_hot[0]).squeeze(-1)
+                
+                predictions.append(one_hot[25:75].detach().cpu().numpy())
+                
+                # Slide by 50
+                del buffer[:50]
+                
+                if progress_cb and total_frames_est:
+                     processed_so_far = len(predictions) * 50
+                     progress_cb(min(0.95, processed_so_far / total_frames_est), f"AutoShot inference ({processed_so_far} frames)")
 
+    if real_frames_count == 0:
+        raise RuntimeError("AutoShot received no frames.")
+
+    # Flush remaining buffer with padding
+    if buffer:
+        last_frame = buffer[-1]
+        # Pad enough to flush pending frames through the center window
+        buffer.extend([last_frame] * 100)
+        
+        while len(buffer) >= 100:
+            batch_frames = buffer[:100]
+            batch_np = np.stack(batch_frames)
+            
             batch_t = torch.from_numpy(
-                batch.transpose((3, 0, 1, 2))[np.newaxis, ...]
-            ).float()
-            batch_t = batch_t.to(device)
-
+                batch_np.transpose((3, 0, 1, 2))[np.newaxis, ...]
+            ).float().to(device)
+            
             one_hot = model(batch_t)
-            if isinstance(one_hot, tuple):
-                one_hot = one_hot[0]
+            if isinstance(one_hot, tuple): one_hot = one_hot[0]
             one_hot = torch.sigmoid(one_hot[0]).squeeze(-1)
-
+            
             predictions.append(one_hot[25:75].detach().cpu().numpy())
+            del buffer[:50]
+            
+            # Stop if we have generated enough predictions to cover real_frames_count
+            if len(predictions) * 50 >= real_frames_count + 50:
+                 break
 
-            if progress_cb:
-                progress_cb((idx + 1) / num_batches, f"AutoShot inference ({idx + 1}/{num_batches})")
-
-    return np.concatenate(predictions, 0)[: len(frames)]
+    final_preds = np.concatenate(predictions, 0)
+    return final_preds[:real_frames_count], real_frames_count
 
 class SceneDetectApp:
     """Main application class encapsulating the GUI and logic."""
@@ -430,6 +518,7 @@ class SceneDetectApp:
         self.abort_flag = threading.Event()
         self.detected_scenes: Optional[List[Tuple[Timecode, Timecode]]] = None
         self.total_frames: int = 0
+        self.loaded_models: dict = {}
 
         # --- Input & Output Variables ---
         self.video_path_var = tk.StringVar()
@@ -623,6 +712,35 @@ class SceneDetectApp:
         self.progress_bar = ttk.Progressbar(run_frame, variable=self.progress_var, maximum=100)
         self.progress_bar.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
         run_frame.columnconfigure(0, weight=1)
+
+    def _get_or_load_model(self, detector_type: str, weights_path: str, device: str):
+        key = (detector_type, weights_path, device)
+        if key in self.loaded_models:
+            return self.loaded_models[key]
+
+        logger.info("Loading %s model (Device: %s)...", detector_type, device)
+        if detector_type == "AutoShot":
+            # Returns (model, device)
+            result = _autoshot_load_model(weights_path, device)
+            self.loaded_models[key] = result
+            return result
+        elif detector_type == "TransNetV2":
+            if TransNetV2 is None:
+                raise RuntimeError(f"TransNetV2 is unavailable: {TRANSNET_IMPORT_ERROR}")
+            if not weights_path or not os.path.exists(weights_path):
+                raise FileNotFoundError(f"TransNetV2 weights file not found: {weights_path}")
+
+            resolved_device = _autoshot_select_device(device)
+            model = TransNetV2(device=resolved_device)
+            model.eval()
+
+            state_dict = torch.load(weights_path, map_location=model.device)
+            model.load_state_dict(state_dict)
+            
+            self.loaded_models[key] = model
+            return model
+        else:
+            raise ValueError(f"Unknown detector: {detector_type}")
 
     def _on_closing(self):
         """Handle the window close event."""
@@ -862,47 +980,45 @@ class SceneDetectApp:
             # --- 2. Detection ---
             detector_type = detector.get("type", "AutoShot")
             if detector_type == "AutoShot":
-                self.progress_queue.put((10, "Loading AutoShot..."))
+                self.progress_queue.put((10, "Checking AutoShot model..."))
 
                 weights_path = str(detector.get("weights_path", "")).strip()
                 if not weights_path:
                     raise FileNotFoundError("AutoShot weights_path is empty. Please select a .pth weights file.")
 
-                model, device = _autoshot_load_model(weights_path, detector.get("device", "auto"))
+                model, device = self._get_or_load_model("AutoShot", weights_path, detector.get("device", "auto"))
 
                 if self.abort_flag.is_set():
                     raise InterruptedError
 
-                self.progress_queue.put((20, "Decoding video frames (AutoShot)..."))
-                frames = _autoshot_get_frames(video_path)
-                frame_count = len(frames)
-                if frame_count <= 0:
-                    raise RuntimeError("AutoShot did not decode any frames.")
+                if self.abort_flag.is_set():
+                    raise InterruptedError
+
+                self.progress_queue.put((20, "Running AutoShot inference (streaming)..."))
+                
+                frames_gen = _autoshot_frame_generator(video_path)
+                
+                def progress_cb(pct: float, msg: str):
+                    self.progress_queue.put((20 + float(pct) * 40.0, msg))
+
+                predictions, frame_count = _autoshot_predict_from_stream(
+                    frames_gen,
+                    model,
+                    device,
+                    total_frames_est=total_frames if total_frames > 0 else None,
+                    abort_flag=self.abort_flag,
+                    progress_cb=progress_cb,
+                )
 
                 if total_frames <= 0:
                     total_frames = frame_count
                     self.total_frames = total_frames
                 elif abs(total_frames - frame_count) > 1:
                     logger.warning(
-                        "Frame count mismatch: ffprobe=%d, ffmpeg=%d. Using ffprobe count for outputs.",
+                        "Frame count mismatch: ffprobe=%d, decoded=%d. Using ffprobe count for outputs.",
                         total_frames,
                         frame_count,
                     )
-
-                if self.abort_flag.is_set():
-                    raise InterruptedError
-
-                def progress_cb(pct: float, msg: str):
-                    self.progress_queue.put((20 + float(pct) * 40.0, msg))
-
-                predictions = _autoshot_predict_from_frames(
-                    frames,
-                    model,
-                    device,
-                    abort_flag=self.abort_flag,
-                    progress_cb=progress_cb,
-                )
-                del frames
 
                 if self.abort_flag.is_set():
                     raise InterruptedError
@@ -916,21 +1032,13 @@ class SceneDetectApp:
                 )
 
             elif detector_type == "TransNetV2":
-                self.progress_queue.put((10, "Loading TransNetV2..."))
-                if TransNetV2 is None:
-                    raise RuntimeError(f"TransNetV2 is unavailable: {TRANSNET_IMPORT_ERROR}")
-
-                model = TransNetV2(device=detector.get("device", "auto"))
-                model.eval()
-
+                self.progress_queue.put((10, "Checking TransNetV2 model..."))
+                
                 weights_path = str(detector.get("weights_path", "")).strip()
                 if not weights_path:
                     raise FileNotFoundError("TransNetV2 weights_path is empty. Please select a .pth weights file.")
-                if not os.path.exists(weights_path):
-                    raise FileNotFoundError(f"TransNetV2 weights file not found: {weights_path}")
-
-                state_dict = torch.load(weights_path, map_location=model.device)
-                model.load_state_dict(state_dict)
+                    
+                model = self._get_or_load_model("TransNetV2", weights_path, detector.get("device", "auto"))
 
                 if self.abort_flag.is_set():
                     raise InterruptedError
@@ -2014,9 +2122,14 @@ class SceneDetectApp:
                                 pass
 
                         # Require multiple strong indicators before keeping a flash cut.
+                        # Fix: Don't allow low s_cut (windowed) to force a KEEP if s_adj is high (meaning immediate neighbors are similar)
+                        s_cut_force = (s_cut < (low_cut_thr - 0.10))
+                        if (s_adj is not None) and (float(s_adj) >= 0.70):
+                            s_cut_force = False
+
                         strong_cut = (strong_signals >= 3) or (
                             (s_adj is not None and float(s_adj) < (self.ADJ_STRONG_CUT - 0.20))
-                        ) or (s_cut < (low_cut_thr - 0.10))
+                        ) or s_cut_force
 
                         if flash_conf >= min_flash_conf:
                             if strong_cut:
@@ -2090,6 +2203,14 @@ class SceneDetectApp:
                         if high_cont:
                             decision_keep = False
                             reason = 'merge_same_shot_continuity'
+                            
+                    # 2d) High Adjacent Merge: Trust DINO adjacent if very high (handles missed flashes/strobes)
+                    if decision_keep and (not is_flash):
+                         if (s_adj is not None) and (float(s_adj) >= float(base_thr)):
+                             # Only Keep if pixel evidence is overwhelmingly for a cut? 
+                             # No, trust DINO. Histograms fail on lighting changes.
+                             decision_keep = False
+                             reason = 'merge_high_adj_dino'
 
                     # 3) Non-flash: strong adjacent discontinuity => KEEP (unless SSCD decided)
                     if (not sscd_decision_lock) and decision_keep and (s_adj is not None) and (float(s_adj) < self.ADJ_STRONG_CUT):
@@ -2714,74 +2835,53 @@ class SceneDetectApp:
         logger.info("Saved thumbnails to directory: %s", images_dir)
 
     def _split_video(self, video_path: str, output_dir: str, fps: float):
-        """Split the input video into per-scene clips with frame-exact boundaries using FFmpeg."""
+        """Split the input video into per-scene clips with frame-exact boundaries using FFmpeg (Parallel)."""
+        import concurrent.futures
+
         if not self.detected_scenes:
             logger.warning("No scenes available to split.")
             return
 
         total_scenes = len(self.detected_scenes)
         logger.info(
-            "Splitting video into %d scenes (frame-exact) using per-scene FFmpeg commands...",
+            "Splitting video into %d scenes (frame-exact) using parallel FFmpeg commands...",
             total_scenes,
         )
 
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+        # --- Capture Settings (Main Thread) ---
+        codec = self.ffmpeg_codec_var.get()
+        preset = self.ffmpeg_preset_var.get()
+        cq_val = str(self.ffmpeg_cq_var.get())
+
         def probe_has_audio(path: str) -> bool:
-            """Best-effort check for an audio stream using ffprobe."""
             try:
                 probe = subprocess.run(
-                    [
-                        "ffprobe",
-                        "-v",
-                        "error",
-                        "-select_streams",
-                        "a",
-                        "-show_entries",
-                        "stream=index",
-                        "-of",
-                        "csv=p=0",
-                        path,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    creationflags=creationflags,
-                    check=False,
+                    ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                    capture_output=True, text=True, creationflags=creationflags, check=False
                 )
                 return probe.returncode == 0 and bool(probe.stdout.strip())
             except FileNotFoundError:
-                # If ffprobe isn't available, assume audio exists and let FFmpeg tell us otherwise.
                 return True
 
         input_has_audio = probe_has_audio(video_path)
 
-        for i, (start_tc, end_tc) in enumerate(self.detected_scenes):
-            scene_num = i + 1
+        def _split_worker(packed_args):
+            idx, start_tc, end_tc = packed_args
             if self.abort_flag.is_set():
-                logger.warning("Video splitting aborted by user.")
                 return
 
-            # progress: 85 -> 100 across splitting
-            self.progress_queue.put_nowait(
-                (85 + (scene_num / max(1, total_scenes)) * 15, f"Splitting scene {scene_num}/{total_scenes}")
-            )
-
+            scene_num = idx + 1
             output_filename = Path(output_dir) / f"{Path(video_path).stem}-Scene-{scene_num:03d}.mp4"
 
-            # Frame-exact boundaries from detected scene list.
             start_frame = int(start_tc.get_frames())
-            end_frame = int(end_tc.get_frames())  # exclusive end
-
-            # For audio trimming we use seconds; FFmpeg accepts floats here.
+            end_frame = int(end_tc.get_frames()) 
             start_sec = float(start_tc.get_seconds())
             end_sec = float(end_tc.get_seconds())
 
-            codec = self.ffmpeg_codec_var.get()
-
-            # --- Build the Command for a Single Scene ---
             command = ["ffmpeg", "-y", "-hide_banner", "-i", video_path]
 
-            # Filter graph: trim by frame for video; trim by time for audio (if present).
             if input_has_audio:
                 filter_graph = (
                     f"[0:v]trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS[v];"
@@ -2792,122 +2892,72 @@ class SceneDetectApp:
                 filter_graph = f"[0:v]trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS[v]"
                 command += ["-filter_complex", filter_graph, "-map", "[v]"]
 
-            # Video encoder settings
             if "nvenc" in codec:
-                command += [
-                    "-c:v",
-                    codec,
-                    "-preset",
-                    self.ffmpeg_preset_var.get(),
-                    "-qp",
-                    str(self.ffmpeg_cq_var.get()),
-                ]
+                command += ["-c:v", codec, "-preset", preset, "-qp", cq_val]
             else:
-                command += [
-                    "-c:v",
-                    codec,
-                    "-preset",
-                    "fast",
-                    "-crf",
-                    str(self.ffmpeg_cq_var.get()),
-                ]
+                command += ["-c:v", codec, "-preset", "fast", "-crf", cq_val]
 
-            # Audio: must be re-encoded after filtering (cannot stream-copy filtered output).
             if input_has_audio:
                 command += ["-c:a", "aac", "-b:a", "192k"]
 
-            # Helpful for MP4 playback while downloading/streaming.
             command += ["-movflags", "+faststart", str(output_filename)]
-
-            logger.debug("Executing FFmpeg command: %s", " ".join(command))
 
             try:
                 result = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    creationflags=creationflags,
-                    check=False,
+                    command, capture_output=True, text=True,
+                    creationflags=creationflags, check=False
                 )
 
-                # If we assumed audio exists but it doesn't, retry once without audio mapping/filtering.
                 if result.returncode != 0 and input_has_audio:
                     stderr_lower = (result.stderr or "").lower()
-                    if (
-                        "matches no streams" in stderr_lower
-                        or "stream specifier" in stderr_lower
-                        or "cannot find a matching stream" in stderr_lower
-                    ):
-                        logger.warning(
-                            "FFmpeg reported no audio stream; retrying scene %d without audio.",
-                            scene_num,
-                        )
+                    if "matches no streams" in stderr_lower or "stream specifier" in stderr_lower:
+                        logger.warning(f"Scene {scene_num}: Audio stream issues, retrying video-only.")
                         filter_graph = f"[0:v]trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS[v]"
-                        command_retry = [
-                            "ffmpeg",
-                            "-y",
-                            "-hide_banner",
-                            "-i",
-                            video_path,
-                            "-filter_complex",
-                            filter_graph,
-                            "-map",
-                            "[v]",
-                        ]
-
+                        command_retry = ["ffmpeg", "-y", "-hide_banner", "-i", video_path,
+                                         "-filter_complex", filter_graph, "-map", "[v]"]
                         if "nvenc" in codec:
-                            command_retry += [
-                                "-c:v",
-                                codec,
-                                "-preset",
-                                self.ffmpeg_preset_var.get(),
-                                "-qp",
-                                str(self.ffmpeg_cq_var.get()),
-                            ]
+                            command_retry += ["-c:v", codec, "-preset", preset, "-qp", cq_val]
                         else:
-                            command_retry += [
-                                "-c:v",
-                                codec,
-                                "-preset",
-                                "fast",
-                                "-crf",
-                                str(self.ffmpeg_cq_var.get()),
-                            ]
-
+                            command_retry += ["-c:v", codec, "-preset", "fast", "-crf", cq_val]
                         command_retry += ["-movflags", "+faststart", str(output_filename)]
 
-                        logger.debug("Retrying FFmpeg command: %s", " ".join(command_retry))
                         result = subprocess.run(
-                            command_retry,
-                            capture_output=True,
-                            text=True,
-                            creationflags=creationflags,
-                            check=False,
+                            command_retry, capture_output=True, text=True,
+                            creationflags=creationflags, check=False
                         )
 
                 if result.returncode != 0:
-                    logger.error(
-                        "FFmpeg failed on scene %d with return code %d",
-                        scene_num,
-                        result.returncode,
-                    )
-                    logger.error("FFmpeg stderr:")
-                    logger.error("%s", result.stderr)
-
-                    msg = f"""FFmpeg failed while splitting scene {scene_num}.
-
-    Return code: {result.returncode}
-
-    See console for details."""
-                    messagebox.showerror("FFmpeg Error", msg)
-                    return
+                    logger.error(f"FFmpeg failed on scene {scene_num}: {result.stderr}")
+                    raise RuntimeError(f"FFmpeg failed: {result.returncode}")
 
             except Exception as e:
-                logger.exception("An error occurred during video splitting.")
-                messagebox.showerror("Splitting Error", f"An error occurred: {e}")
-                return
+                logger.error(f"Error splitting scene {scene_num}: {e}")
+                raise
 
-        logger.info("Successfully split video into %d scenes.", total_scenes)
+        max_workers = min(4, os.cpu_count() or 4)
+        tasks = []
+        completed_count = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for i, (start_tc, end_tc) in enumerate(self.detected_scenes):
+                tasks.append(executor.submit(_split_worker, (i, start_tc, end_tc)))
+
+            for future in concurrent.futures.as_completed(tasks):
+                if self.abort_flag.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    logger.warning("Parallel split aborted.")
+                    return
+
+                try:
+                    future.result()
+                    completed_count += 1
+                    pct = 85 + (completed_count / total_scenes) * 15
+                    self.progress_queue.put_nowait((pct, f"Splitting scenes Parallel ({completed_count}/{total_scenes})"))
+                except Exception as e:
+                    logger.error(f"Worker task failed: {e}")
+                    # We continue despite errors in single scenes
+        
+        logger.info("Parallel splitting finished. Processed %d/%d scenes.", completed_count, total_scenes)
 
     def _process_queues(self) -> None:
         while not self.progress_queue.empty():

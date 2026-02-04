@@ -1,6 +1,6 @@
 {
-    "video_path": "C:/Users/Nexus/Videos/_3D_Conv_/StrangerTings/StrangerThings4e7-clip.mkv",
-    "output_dir": "C:\\Users\\Nexus\\Videos\\_3D_Conv_\\StrangerTings\\StrangerThings4e7-clip",
+    "video_path": "C:/Users/Nexus/Videos/_3D_Conv_/StrangerTings/TestVid.mkv",
+    "output_dir": "C:\\Users\\Nexus\\Videos\\_3D_Conv_\\StrangerTings\\TestVid",
     "detector_type": "TransNetV2",
     "detector_params": {
         "AutoShot": {
@@ -10,8 +10,8 @@
         },
         "TransNetV2": {
             "device": "auto",
-            "threshold": "0.5",
-            "min_scene_len": "6"
+            "threshold": "0.296",
+            "min_scene_len": "8"
         }
     },
     "ai_validate": true,
