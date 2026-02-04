@@ -48,7 +48,7 @@ logger = logging.getLogger("SceneDetectGUI")
 KEEP_FG, MERG_FG, BOLD, RESET = "\033[94m", "\033[92m", "\033[1m", "\033[0m"
 
 # ------------------------------------------------------------------ #
-# Optional TransNetV2 dependency (recommended detector)
+# TransNetV2 dependency (primary detector)
 # ------------------------------------------------------------------ #
 try:
     import torch  # noqa: F401
