@@ -2384,6 +2384,7 @@ class SceneDetectApp:
         except Exception as e:
             raise RuntimeError("PySceneDetect is not installed. Install 'scenedetect'.") from e
 
+        refine_threshold = float(self.refine_threshold_var.get() or 27.0)
         # Collect cuts from PySceneDetect (ContentDetector)
         logger.info(
             "PySceneDetect refinement: starting (threshold=%.2f, snap_window=%d)",
@@ -2391,7 +2392,6 @@ class SceneDetectApp:
             snap_window,
         )
         cut_frames = []
-        refine_threshold = float(self.refine_threshold_var.get() or 27.0)
 
         try:
             from scenedetect import open_video, SceneManager
