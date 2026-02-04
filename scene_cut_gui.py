@@ -554,7 +554,7 @@ class SceneDetectApp:
         self._attach_tooltip(ai_spin, "ai_window")
         
         ttk.Label(ai_frame, text="Flash Sensitivity:").grid(row=1, column=2, padx=(20, 5), pady=5, sticky="w")
-        flash_spin = ttk.Spinbox(ai_frame, from_=15, to=80, textvariable=self.flash_sensitivity_var, width=5)
+        flash_spin = ttk.Spinbox(ai_frame, from_=10, to=80, textvariable=self.flash_sensitivity_var, width=5)
         flash_spin.grid(row=1, column=3, padx=5, pady=5, sticky="w")
         self._attach_tooltip(flash_spin, "flash_sensitivity")
 
@@ -991,7 +991,7 @@ class SceneDetectApp:
                 FLASH_BASE_GAP = 5      # baseline windows start beyond this offset from the cut
 
                 FLASH_MIN_DUR = 1
-                FLASH_MAX_DUR = 9
+                FLASH_MAX_DUR = 8
 
                 # --- Pixel cue (HSV H,S histogram intersection in [0,1]) ---
                 PIXEL_HIST_MIN = 0.08
