@@ -87,6 +87,7 @@ pip install opencv_contrib_python-4.13.0.90-cp37-abi3-win_amd64.whl
 | `model.safetensors` | DINOv3 model (for AI validation) |
 | `config.json` | DINOv3 model config |
 | `preprocessor_config.json` | DINOv3 preprocessor config |
+| `sscd_disc_large.torchscript.pt` | SSCD model (for AI validation) |
 
 ---
 
