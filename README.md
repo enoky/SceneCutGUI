@@ -1,6 +1,6 @@
 # SceneCutGUI
 
-A modern, GPU-accelerated scene detection and video slicing tool with an intuitive Tkinter GUI. Uses **TransNetV2** neural network for highly accurate shot boundary detection, with optional **DINOv3-based AI validation** to filter false positives.
+A modern, GPU-accelerated scene detection and video slicing tool with an intuitive Tkinter GUI. Uses **AutoShot** or **TransNetV2** neural networks for highly accurate shot boundary detection, with optional **DINOv3-based AI validation** to filter false positives.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -10,7 +10,7 @@ A modern, GPU-accelerated scene detection and video slicing tool with an intuiti
 
 ## ✨ Features
 
-- **TransNetV2 Detection** — State-of-the-art neural network for shot boundary detection
+- **AutoShot / TransNetV2 Detection** — State-of-the-art neural networks for shot boundary detection
 - **DINOv3/SSCD AI Validation** — Optional post-processing to filter out flashes, fast motion, and near-black false positives
 - **GPU Acceleration** — CUDA support for both video decoding (OpenCV) and model inference (PyTorch)
 - **Multiple Export Formats**:
@@ -36,6 +36,7 @@ A modern, GPU-accelerated scene detection and video slicing tool with an intuiti
 torch>=2.0
 torchvision
 torchaudio
+einops
 transnetv2-pytorch
 transformers
 numpy
@@ -80,10 +81,11 @@ pip install opencv_contrib_python-4.13.0.90-cp37-abi3-win_amd64.whl
 
 ### 4. Download Model Weights
 
-<a href="https://drive.google.com/file/d/1aJ96eJE4DstJ_HBzAusuYLvfU01Jnc92/view?usp=sharing">Download Model Weights</a> and place them in the `weights/` directory:
+Place the model checkpoints in the `weights/` directory:
 
 | File                             | Description                      |
 | -------------------------------- | -------------------------------- |
+| `ckpt_0_200_0.pth`               | AutoShot model weights           |
 | `transnetv2-pytorch-weights.pth` | TransNetV2 model weights         |
 | `model.safetensors`              | DINOv3 model (for AI validation) |
 | `config.json`                    | DINOv3 model config              |
@@ -126,7 +128,7 @@ RUN_SceneCutGUI.bat
 | Parameter       | Default | Description                                   |
 | --------------- | ------- | --------------------------------------------- |
 | `device`        | `auto`  | Compute device (`auto`, `cuda`, `cpu`, `mps`) |
-| `threshold`     | `0.5`   | Cut detection sensitivity (0–1)               |
+| `threshold`     | `0.296` (AutoShot) / `0.3` (TransNetV2) | Cut detection sensitivity (0–1)               |
 | `min_scene_len` | `8`     | Minimum scene length in frames                |
 
 ### AI Validation (Optional)
@@ -160,9 +162,9 @@ RUN_SceneCutGUI.bat
 
 ## 🧠 How It Works
 
-### TransNetV2 Detection
+### AutoShot and TransNetV2 Detection
 
-TransNetV2 is a deep learning model specifically trained for shot boundary detection. It processes video frames and outputs probability scores for each frame being a scene transition.
+AutoShot and TransNetV2 are deep learning models trained for shot boundary detection. Use the detector selector in the GUI to switch between them based on your content and performance needs.
 
 ### DINOv3 AI Validation
 
@@ -195,7 +197,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🙏 Acknowledgments
 
-- [TransNetV2](https://github.com/soCzech/TransNetV2) — Shot boundary detection model
-- [transnetv2-pytorch](https://pypi.org/project/transnetv2-pytorch/) — PyTorch implementation
+- [TransNetV2](https://github.com/soCzech/TransNetV2) ? Shot boundary detection model
+- [transnetv2-pytorch](https://pypi.org/project/transnetv2-pytorch/) ? PyTorch implementation
+- [AutoShot](https://github.com/wentaozhu/AutoShot) — Shot boundary detection model
 - [DINOv3](https://github.com/facebookresearch/dinov3) — Vision transformer for validation
 - [FFmpeg](https://ffmpeg.org/) — Video processing backend

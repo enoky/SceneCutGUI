@@ -48,14 +48,50 @@ logger = logging.getLogger("SceneDetectGUI")
 KEEP_FG, MERG_FG, BOLD, RESET = "\033[94m", "\033[92m", "\033[1m", "\033[0m"
 
 # ------------------------------------------------------------------ #
-# TransNetV2 dependency (primary detector)
+# Torch dependency
 # ------------------------------------------------------------------ #
+TORCH_IMPORT_ERROR = None
 try:
     import torch  # noqa: F401
+except Exception as e:
+    torch = None
+    TORCH_IMPORT_ERROR = e
+    logger.error("Failed to import torch. Please ensure PyTorch is installed: %s", e)
+
+# ------------------------------------------------------------------ #
+# AutoShot dependency
+# ------------------------------------------------------------------ #
+AUTO_SHOT_IMPORT_ERROR = None
+AutoShotNet = None
+try:
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    AUTO_SHOT_DIR = Path(__file__).resolve().parent / "AutoShot"
+    if AUTO_SHOT_DIR.exists():
+        sys.path.insert(0, str(AUTO_SHOT_DIR))
+    from supernet_flattransf_3_8_8_8_13_12_0_16_60 import TransNetV2Supernet as AutoShotNet
+except Exception as e:
+    AUTO_SHOT_IMPORT_ERROR = e
+    logger.error(
+        "Failed to import AutoShot model. Ensure AutoShot repo is present and 'einops' is installed: %s",
+        e,
+    )
+
+# ------------------------------------------------------------------ #
+# TransNetV2 dependency
+# ------------------------------------------------------------------ #
+TRANSNET_IMPORT_ERROR = None
+TransNetV2 = None
+try:
+    if torch is None:
+        raise RuntimeError("torch is not available")
     from transnetv2_pytorch import TransNetV2
 except Exception as e:
-    logger.error("Failed to import TransNetV2 (transnetv2-pytorch). Please ensure it is installed: %s", e)
-    TransNetV2 = None
+    TRANSNET_IMPORT_ERROR = e
+    logger.error(
+        "Failed to import TransNetV2 (transnetv2-pytorch). Please ensure it is installed: %s",
+        e,
+    )
 
 # ------------------------------------------------------------------ #
 # Minimal timecode abstraction (minimal timecode abstraction for this GUI)
@@ -159,12 +195,10 @@ def transnetv2_scenes_to_timecodes(
 
     last_end = 0
     for s in tn_scenes:
-        # Prefer explicit frame indices if available
         if isinstance(s, dict) and "start_frame" in s and "end_frame" in s:
             start_f = int(s["start_frame"])
             end_f = int(s["end_frame"])
         else:
-            # Fallback to seconds
             start_t = float(s.get("start_time", 0.0)) if isinstance(s, dict) else 0.0
             end_t = float(s.get("end_time", 0.0)) if isinstance(s, dict) else 0.0
             start_f = int(round(start_t * fps))
@@ -190,6 +224,191 @@ def transnetv2_scenes_to_timecodes(
 
     return scenes_out
 
+
+def _autoshot_select_device(requested: str) -> str:
+    if requested in {"auto", "", None}:
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
+    if requested == "mps" and not (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
+        raise RuntimeError("MPS requested but not available.")
+    return str(requested)
+
+
+def _autoshot_load_model(weights_path: str, device: str):
+    if torch is None:
+        raise RuntimeError(f"PyTorch is unavailable: {TORCH_IMPORT_ERROR}")
+    if AutoShotNet is None:
+        raise RuntimeError(f"AutoShot is unavailable: {AUTO_SHOT_IMPORT_ERROR}")
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(f"AutoShot weights file not found: {weights_path}")
+
+    device = _autoshot_select_device(device)
+    model = AutoShotNet().eval()
+
+    ckpt = torch.load(weights_path, map_location=device)
+    if isinstance(ckpt, dict) and "net" in ckpt:
+        ckpt = ckpt["net"]
+
+    model_dict = model.state_dict()
+    pretrained = {k: v for k, v in ckpt.items() if k in model_dict}
+    if not pretrained:
+        raise RuntimeError("AutoShot checkpoint did not match model parameters.")
+    model_dict.update(pretrained)
+    model.load_state_dict(model_dict)
+    model.to(device)
+    model.eval()
+    return model, device
+
+
+def _autoshot_get_frames(video_path: str, width: int = 48, height: int = 27):
+    import numpy as np
+
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        video_path,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, check=False, creationflags=creationflags)
+    if result.returncode != 0:
+        err = (result.stderr or b"").decode("utf-8", errors="ignore")
+        raise RuntimeError(f"FFmpeg failed to decode frames: {err.strip()}")
+
+    raw = result.stdout or b""
+    frame_size = width * height * 3
+    if len(raw) < frame_size:
+        raise RuntimeError("FFmpeg returned no frames for AutoShot inference.")
+
+    frame_count = len(raw) // frame_size
+    raw = raw[: frame_count * frame_size]
+    frames = np.frombuffer(raw, np.uint8).reshape((frame_count, height, width, 3))
+    return frames
+
+
+def _autoshot_get_batches(frames):
+    import numpy as np
+
+    remainder = 50 - len(frames) % 50
+    if remainder == 50:
+        remainder = 0
+    frames = np.concatenate([frames[:1]] * 25 + [frames] + [frames[-1:]] * (remainder + 25), 0)
+
+    for i in range(0, len(frames) - 50, 50):
+        yield frames[i : i + 100]
+
+
+def _autoshot_predictions_to_scenes(predictions):
+    import numpy as np
+
+    pred = np.asarray(predictions).reshape(-1)
+    pred = pred.astype(np.uint8)
+    scenes = []
+    t_prev, start = 0, 0
+    t = 0
+    for i, t in enumerate(pred):
+        t = int(t)
+        if t_prev == 1 and t == 0:
+            start = i
+        if t_prev == 0 and t == 1 and i != 0:
+            scenes.append([start, i])
+        t_prev = t
+
+    if len(pred) > 0 and t == 0:
+        scenes.append([start, len(pred) - 1])
+
+    if len(scenes) == 0 and len(pred) > 0:
+        scenes = [[0, len(pred) - 1]]
+
+    return np.array(scenes, dtype=np.int32)
+
+
+def autoshot_predictions_to_timecodes(
+    predictions,
+    fps: float,
+    total_frames: int,
+    threshold: float,
+) -> list[tuple[Timecode, Timecode]]:
+    import numpy as np
+
+    pred = np.asarray(predictions).reshape(-1)
+    if total_frames <= 0:
+        total_frames = len(pred)
+    if len(pred) < total_frames:
+        pred = np.pad(pred, (0, total_frames - len(pred)), mode="constant", constant_values=0)
+    pred = pred[:total_frames]
+
+    binary = (pred > float(threshold)).astype(np.uint8)
+    scenes = _autoshot_predictions_to_scenes(binary)
+
+    scenes_out: list[tuple[Timecode, Timecode]] = []
+    last_end = 0
+    for start_f, end_f_incl in scenes:
+        start_f = int(start_f)
+        end_f_excl = int(end_f_incl) + 1
+
+        start_f = max(0, min(start_f, total_frames))
+        end_f_excl = max(start_f + 1, min(end_f_excl, total_frames))
+
+        start_f = max(start_f, last_end)
+        end_f_excl = max(end_f_excl, start_f + 1)
+        last_end = end_f_excl
+
+        scenes_out.append((Timecode(start_f, fps), Timecode(end_f_excl, fps)))
+
+    if scenes_out and scenes_out[-1][1].get_frames() < total_frames:
+        scenes_out[-1] = (scenes_out[-1][0], Timecode(total_frames, fps))
+
+    if not scenes_out and total_frames > 0:
+        scenes_out = [(Timecode(0, fps), Timecode(total_frames, fps))]
+
+    return scenes_out
+
+
+def _autoshot_predict_from_frames(frames, model, device, abort_flag=None, progress_cb=None):
+    import numpy as np
+
+    if frames is None or len(frames) == 0:
+        raise RuntimeError("AutoShot received no frames for inference.")
+
+    num_batches = max(1, (len(frames) + 49) // 50)
+    predictions = []
+
+    with torch.no_grad():
+        for idx, batch in enumerate(_autoshot_get_batches(frames)):
+            if abort_flag is not None and abort_flag.is_set():
+                raise InterruptedError
+
+            batch_t = torch.from_numpy(
+                batch.transpose((3, 0, 1, 2))[np.newaxis, ...]
+            ).float()
+            batch_t = batch_t.to(device)
+
+            one_hot = model(batch_t)
+            if isinstance(one_hot, tuple):
+                one_hot = one_hot[0]
+            one_hot = torch.sigmoid(one_hot[0]).squeeze(-1)
+
+            predictions.append(one_hot[25:75].detach().cpu().numpy())
+
+            if progress_cb:
+                progress_cb((idx + 1) / num_batches, f"AutoShot inference ({idx + 1}/{num_batches})")
+
+    return np.concatenate(predictions, 0)[: len(frames)]
+
 class SceneDetectApp:
     """Main application class encapsulating the GUI and logic."""
 
@@ -210,8 +429,13 @@ class SceneDetectApp:
         self.output_dir_var = tk.StringVar()
 
         # --- Detector & AI Variables ---
-        self.detector_type_var = tk.StringVar(value="TransNetV2")
+        self.detector_type_var = tk.StringVar(value="AutoShot")
         self.params_vars: dict = {}
+        self.detector_params_cache: dict[str, dict[str, str]] = {
+            "AutoShot": self._default_detector_params("AutoShot"),
+            "TransNetV2": self._default_detector_params("TransNetV2"),
+        }
+        self._last_detector_type = self.detector_type_var.get()
         self.ai_validate_var = tk.BooleanVar(value=False)
         self.ai_window_var = tk.IntVar(value=5)
         self.flash_sensitivity_var = tk.IntVar(value=15)  # Luma delta threshold for flash detection
@@ -279,10 +503,19 @@ class SceneDetectApp:
         config_frame.columnconfigure(0, weight=2) # Detector params take more space
         config_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(config_frame, text="Detector:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        detector_label = ttk.Label(config_frame, text="TransNetV2 (PyTorch)")
-        detector_label.grid(row=0, column=0, padx=(65, 5), pady=5, sticky="w")
-        self._attach_tooltip(detector_label, "detector_type")
+        detector_row = ttk.Frame(config_frame)
+        detector_row.grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        ttk.Label(detector_row, text="Detector:").pack(side=tk.LEFT)
+        detector_combo = ttk.Combobox(
+            detector_row,
+            textvariable=self.detector_type_var,
+            values=["AutoShot", "TransNetV2"],
+            state="readonly",
+            width=14,
+        )
+        detector_combo.pack(side=tk.LEFT, padx=(10, 0))
+        detector_combo.bind("<<ComboboxSelected>>", self._on_detector_change)
+        self._attach_tooltip(detector_combo, "detector_type")
         
         self.params_frame = ttk.Frame(config_frame)
         self.params_frame.grid(row=1, column=0, sticky="nsew", padx=5)
@@ -368,13 +601,27 @@ class SceneDetectApp:
         self._save_settings()
         self.root.destroy()
 
+    def _default_detector_params(self, detector_type: str) -> dict[str, str]:
+        threshold = "0.296" if detector_type == "AutoShot" else "0.3"
+        return {
+            "device": "auto",
+            "threshold": threshold,
+            "min_scene_len": "8",
+        }
+
+    def _cache_detector_params(self, detector_type: str | None) -> None:
+        if not detector_type or not self.params_vars:
+            return
+        self.detector_params_cache[detector_type] = {k: v.get() for k, v in self.params_vars.items()}
+
     def _save_settings(self):
         """Save all GUI settings to a JSON file."""
+        self._cache_detector_params(self.detector_type_var.get())
         settings = {
             "video_path": self.video_path_var.get(),
             "output_dir": self.output_dir_var.get(),
             "detector_type": self.detector_type_var.get(),
-            "detector_params": {key: var.get() for key, var in self.params_vars.items()},
+            "detector_params": self.detector_params_cache,
             "ai_validate": self.ai_validate_var.get(),
             "ai_window": self.ai_window_var.get(),
             "flash_sensitivity": self.flash_sensitivity_var.get(),
@@ -421,17 +668,24 @@ class SceneDetectApp:
             self.ffmpeg_preset_var.set(settings.get("ffmpeg_preset", "p7"))
             self.ffmpeg_cq_var.set(settings.get("ffmpeg_cq", 16))
             
-            # Set detector type first, which rebuilds the params UI
-            detector_type = settings.get("detector_type", "TransNetV2")
-            self.detector_type_var.set("TransNetV2")
-            self._build_detector_params() # Ensure params_vars is populated
+            # Detector type & per-detector params
+            detector_type = settings.get("detector_type", "AutoShot")
+            if detector_type not in {"AutoShot", "TransNetV2"}:
+                detector_type = "AutoShot"
 
-            # Now set the specific parameters for that detector
-            if "detector_params" in settings:
-                loaded_params = settings["detector_params"]
-                for key, var in self.params_vars.items():
-                    if key in loaded_params:
-                        var.set(loaded_params[key])
+            loaded_params = settings.get("detector_params")
+            if isinstance(loaded_params, dict):
+                if any(k in loaded_params for k in ("AutoShot", "TransNetV2")):
+                    for det in ("AutoShot", "TransNetV2"):
+                        det_params = loaded_params.get(det)
+                        if isinstance(det_params, dict):
+                            self.detector_params_cache[det].update(det_params)
+                else:
+                    # Legacy flat params -> apply to selected detector
+                    self.detector_params_cache[detector_type].update(loaded_params)
+
+            self.detector_type_var.set(detector_type)
+            self._build_detector_params() # Ensure params_vars is populated
 
             logger.info(f"Successfully loaded settings from {self.CONFIG_FILE}.")
         except Exception as e:
@@ -451,34 +705,40 @@ class SceneDetectApp:
             self.output_dir_var.set(directory)
 
     def _on_detector_change(self, event=None):
-        # Detector is fixed to TransNetV2.
+        prev_detector = getattr(self, "_last_detector_type", None)
+        self._cache_detector_params(prev_detector)
+        self._build_detector_params()
         return
 
     def _build_detector_params(self):
-        """Build TransNetV2 parameter widgets."""
+        """Build detector parameter widgets."""
         for widget in self.params_frame.winfo_children():
             widget.destroy()
 
         # Clear and rebuild vars
         self.params_vars.clear()
 
+        detector_type = self.detector_type_var.get()
+        params = self.detector_params_cache.get(detector_type, self._default_detector_params(detector_type))
+        default_threshold = "0.296" if detector_type == "AutoShot" else "0.3"
+
         # Row 0: device
         ttk.Label(self.params_frame, text="device:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
-        d_var = tk.StringVar(value="auto")
+        d_var = tk.StringVar(value=str(params.get("device", "auto")))
         d_combo = ttk.Combobox(self.params_frame, textvariable=d_var, values=["auto", "cpu", "cuda", "mps"], state="readonly", width=10)
         d_combo.grid(row=0, column=1, padx=5, pady=2, sticky="w")
         self._attach_tooltip(d_combo, "device")
 
         # Row 1: threshold
         ttk.Label(self.params_frame, text="threshold:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
-        t_var = tk.StringVar(value="0.3")
+        t_var = tk.StringVar(value=str(params.get("threshold", default_threshold)))
         t_entry = ttk.Entry(self.params_frame, textvariable=t_var, width=10)
         t_entry.grid(row=1, column=1, padx=5, pady=2, sticky="w")
         self._attach_tooltip(t_entry, "threshold")
 
         # Row 2: min_scene_len
         ttk.Label(self.params_frame, text="min_scene_len (frames):").grid(row=2, column=0, padx=5, pady=2, sticky="w")
-        m_var = tk.StringVar(value="8")
+        m_var = tk.StringVar(value=str(params.get("min_scene_len", "8")))
         m_entry = ttk.Entry(self.params_frame, textvariable=m_var, width=10)
         m_entry.grid(row=2, column=1, padx=5, pady=2, sticky="w")
         self._attach_tooltip(m_entry, "min_scene_len")
@@ -487,6 +747,7 @@ class SceneDetectApp:
         self.params_vars["device"] = d_var
         self.params_vars["threshold"] = t_var
         self.params_vars["min_scene_len"] = m_var
+        self._last_detector_type = detector_type
 
 
     def _start_detection(self) -> None:
@@ -495,12 +756,33 @@ class SceneDetectApp:
         if not video_path or not output_dir:
             messagebox.showerror("Error", "Please select a video file and an output folder.")
             return
-        if TransNetV2 is None:
-            messagebox.showerror("Error", "TransNetV2 (transnetv2-pytorch) is not installed.")
+        detector_type = self.detector_type_var.get()
+        if detector_type == "AutoShot":
+            if AutoShotNet is None:
+                detail = f"\n\nImport error: {AUTO_SHOT_IMPORT_ERROR}" if AUTO_SHOT_IMPORT_ERROR else ""
+                messagebox.showerror(
+                    "Error",
+                    "AutoShot is not available. Ensure the AutoShot repo exists and install 'einops'."
+                    + detail,
+                )
+                return
+            default_weights = "./weights/ckpt_0_200_0.pth"
+        elif detector_type == "TransNetV2":
+            if TransNetV2 is None:
+                detail = f"\n\nImport error: {TRANSNET_IMPORT_ERROR}" if TRANSNET_IMPORT_ERROR else ""
+                messagebox.showerror(
+                    "Error",
+                    "TransNetV2 is not available. Ensure 'transnetv2-pytorch' is installed."
+                    + detail,
+                )
+                return
+            default_weights = "./weights/transnetv2-pytorch-weights.pth"
+        else:
+            messagebox.showerror("Error", f"Unknown detector type: {detector_type}")
             return
 
         try:
-            weights_path = "./weights/transnetv2-pytorch-weights.pth"
+            weights_path = default_weights
             device = str(self.params_vars.get("device").get()).strip() or "auto"
             threshold = float(self.params_vars.get("threshold").get())
             min_scene_len = int(float(self.params_vars.get("min_scene_len").get()))
@@ -509,11 +791,12 @@ class SceneDetectApp:
             if min_scene_len < 1:
                 min_scene_len = 1
         except Exception as exc:
-            logger.error("Invalid TransNetV2 parameters: %s", exc)
-            messagebox.showerror("Parameter Error", f"Invalid TransNetV2 parameters: {exc}")
+            logger.error("Invalid %s parameters: %s", detector_type, exc)
+            messagebox.showerror("Parameter Error", f"Invalid {detector_type} parameters: {exc}")
             return
 
         detector_cfg = {
+            "type": detector_type,
             "weights_path": weights_path,
             "device": device,
             "threshold": threshold,
@@ -526,7 +809,7 @@ class SceneDetectApp:
         self.abort_button.config(state=tk.NORMAL)
         self.abort_flag.clear()
         self.detected_scenes = None
-        logger.info("Starting detection process (TransNetV2)...")
+        logger.info("Starting detection process (%s)...", detector_type)
 
         threading.Thread(target=self._detection_and_output_task, args=(video_path, output_dir, detector_cfg), daemon=True).start()
     def _detection_and_output_task(self, video_path: str, output_dir: str, detector: dict) -> None:
@@ -541,34 +824,97 @@ class SceneDetectApp:
             if self.abort_flag.is_set():
                 raise InterruptedError
 
-            # --- 2. Detection (TransNetV2) ---
-            self.progress_queue.put((10, "Loading TransNetV2..."))
-            import torch
+            # --- 2. Detection ---
+            detector_type = detector.get("type", "AutoShot")
+            if detector_type == "AutoShot":
+                self.progress_queue.put((10, "Loading AutoShot..."))
 
-            model = TransNetV2(device=detector.get("device", "auto"))
-            model.eval()
+                weights_path = str(detector.get("weights_path", "")).strip()
+                if not weights_path:
+                    raise FileNotFoundError("AutoShot weights_path is empty. Please select a .pth weights file.")
 
-            weights_path = str(detector.get("weights_path", "")).strip()
-            if not weights_path:
-                raise FileNotFoundError("TransNetV2 weights_path is empty. Please select a .pth weights file.")
-            if not os.path.exists(weights_path):
-                raise FileNotFoundError(f"TransNetV2 weights file not found: {weights_path}")
+                model, device = _autoshot_load_model(weights_path, detector.get("device", "auto"))
 
-            state_dict = torch.load(weights_path, map_location=model.device)
-            model.load_state_dict(state_dict)
+                if self.abort_flag.is_set():
+                    raise InterruptedError
 
-            if self.abort_flag.is_set():
-                raise InterruptedError
+                self.progress_queue.put((20, "Decoding video frames (AutoShot)..."))
+                frames = _autoshot_get_frames(video_path)
+                frame_count = len(frames)
+                if frame_count <= 0:
+                    raise RuntimeError("AutoShot did not decode any frames.")
 
-            self.progress_queue.put((20, "Running TransNetV2 inference..."))
-            with torch.no_grad():
-                tn_scenes = model.detect_scenes(video_path, threshold=float(detector.get("threshold", 0.3)))
+                if total_frames <= 0:
+                    total_frames = frame_count
+                    self.total_frames = total_frames
+                elif abs(total_frames - frame_count) > 1:
+                    logger.warning(
+                        "Frame count mismatch: ffprobe=%d, ffmpeg=%d. Using ffprobe count for outputs.",
+                        total_frames,
+                        frame_count,
+                    )
 
-            if self.abort_flag.is_set():
-                raise InterruptedError
+                if self.abort_flag.is_set():
+                    raise InterruptedError
 
-            self.progress_queue.put((60, f"TransNetV2 returned {len(tn_scenes)} scenes. Converting..."))
-            scenes = transnetv2_scenes_to_timecodes(tn_scenes, fps=fps, total_frames=total_frames)
+                def progress_cb(pct: float, msg: str):
+                    self.progress_queue.put((20 + float(pct) * 40.0, msg))
+
+                predictions = _autoshot_predict_from_frames(
+                    frames,
+                    model,
+                    device,
+                    abort_flag=self.abort_flag,
+                    progress_cb=progress_cb,
+                )
+                del frames
+
+                if self.abort_flag.is_set():
+                    raise InterruptedError
+
+                self.progress_queue.put((60, f"AutoShot produced {len(predictions)} frame scores. Converting..."))
+                scenes = autoshot_predictions_to_timecodes(
+                    predictions,
+                    fps=fps,
+                    total_frames=total_frames,
+                    threshold=float(detector.get("threshold", 0.296) or 0.296),
+                )
+
+            elif detector_type == "TransNetV2":
+                self.progress_queue.put((10, "Loading TransNetV2..."))
+                if TransNetV2 is None:
+                    raise RuntimeError(f"TransNetV2 is unavailable: {TRANSNET_IMPORT_ERROR}")
+
+                model = TransNetV2(device=detector.get("device", "auto"))
+                model.eval()
+
+                weights_path = str(detector.get("weights_path", "")).strip()
+                if not weights_path:
+                    raise FileNotFoundError("TransNetV2 weights_path is empty. Please select a .pth weights file.")
+                if not os.path.exists(weights_path):
+                    raise FileNotFoundError(f"TransNetV2 weights file not found: {weights_path}")
+
+                state_dict = torch.load(weights_path, map_location=model.device)
+                model.load_state_dict(state_dict)
+
+                if self.abort_flag.is_set():
+                    raise InterruptedError
+
+                self.progress_queue.put((20, "Running TransNetV2 inference..."))
+                with torch.no_grad():
+                    tn_scenes = model.detect_scenes(
+                        video_path,
+                        threshold=float(detector.get("threshold", 0.3)),
+                    )
+
+                if self.abort_flag.is_set():
+                    raise InterruptedError
+
+                self.progress_queue.put((60, f"TransNetV2 returned {len(tn_scenes)} scenes. Converting..."))
+                scenes = transnetv2_scenes_to_timecodes(tn_scenes, fps=fps, total_frames=total_frames)
+
+            else:
+                raise RuntimeError(f"Unknown detector type: {detector_type}")
 
             # Enforce minimum scene length (frames)
             min_len = int(detector.get("min_scene_len", 1) or 1)
@@ -580,7 +926,7 @@ class SceneDetectApp:
                 # Keep at least one
                 scenes = filtered or [scenes[0]]
 
-            logger.info("Detected %d raw scenes (TransNetV2)", len(scenes))
+            logger.info("Detected %d raw scenes (%s)", len(scenes), detector_type)
 
             # --- 3. AI Validation (Optional) ---
             if self.ai_validate_var.get() and scenes:
@@ -1867,6 +2213,7 @@ class SceneDetectApp:
                 f"<td>{dur_f}</td><td>{_format_hhmmss_ms(dur_s)}</td></tr>"
             )
 
+        detector_label = self.detector_type_var.get() or "Detector"
         html = (
             "<!doctype html><html><head><meta charset='utf-8'/>"
             "<title>Scene List</title>"
@@ -1876,7 +2223,7 @@ class SceneDetectApp:
             "th,td{border:1px solid #ccc; padding:6px 8px; text-align:left;}"
             "th{background:#f3f3f3;}"
             "</style></head><body>"
-            "<h2>Detected Scenes (TransNetV2)</h2>"
+            f"<h2>Detected Scenes ({detector_label})</h2>"
             "<table><thead><tr>"
             "<th>Scene</th><th>Start Time</th><th>Start Frame</th>"
             "<th>End Time</th><th>End Frame (exclusive)</th>"
