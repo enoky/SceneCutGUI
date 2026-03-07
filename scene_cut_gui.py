@@ -525,7 +525,7 @@ class SceneDetectApp:
         self.output_dir_var = tk.StringVar()
 
         # --- Detector & AI Variables ---
-        self.detector_type_var = tk.StringVar(value="AutoShot")
+        self.detector_type_var = tk.StringVar(value="TransNetV2")
         self.params_vars: dict = {}
         self.detector_params_cache: dict[str, dict[str, str]] = {
             "AutoShot": self._default_detector_params("AutoShot"),
