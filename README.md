@@ -38,7 +38,6 @@ torchvision
 torchaudio
 einops
 transnetv2-pytorch
-scenedetect
 transformers
 numpy
 opencv-contrib-python with CUDA (see link below)
@@ -130,22 +129,22 @@ RUN_SceneCutGUI.bat
 | --------------- | --------------------------------------- | --------------------------------------------- |
 | `device`        | `auto`                                  | Compute device (`auto`, `cuda`, `cpu`, `mps`) |
 | `threshold`     | `0.296` (AutoShot) / `0.3` (TransNetV2) | Cut detection sensitivity (0–1)               |
-| `min_scene_len` | `8`                                     | Minimum scene length in frames (very short scenes are preserved by default) |
+| `min_scene_len` | `8`                                     | Minimum scene length in frames                |
 
 ### AI Validation (Optional)
 
-| Parameter     | Default | Description                        |
-| ------------- | ------- | ---------------------------------- |
-| `ai_validate` | `false` | Enable DINOv3 validation           |
-| `ai_window`   | `3`     | Frames before/after cut to analyze |
+| Parameter           | Default | Description                                    |
+| ------------------- | ------- | ---------------------------------------------- |
+| `ai_validate`       | `false` | Enable DINOv3/SSCD validation                  |
+| `ai_window`         | `5`     | Frames before/after cut to analyze             |
+| `flash_sensitivity` | `15`    | Luma delta threshold for flash detection       |
 
-### PySceneDetect Refinement (Optional)
+### Image & Thumbnail Settings
 
-| Parameter              | Default | Description |
-| ---------------------- | ------- | ----------- |
-| `refine_pyscenedetect` | `false` | Snap cuts to nearest PySceneDetect ContentDetector cut |
-| `refine_snap`          | `6`     | Snap window in frames |
-| `refine_threshold`     | `27.0`  | PySceneDetect ContentDetector threshold |
+| Parameter      | Default | Description                                  |
+| -------------- | ------- | -------------------------------------------- |
+| `num_images`   | `3`     | Number of thumbnail images to save per scene |
+| `frame_margin` | `1`     | Frame offset margin for thumbnail capture    |
 
 ### FFmpeg Output Settings
 
