@@ -535,9 +535,6 @@ class SceneDetectApp:
         self.ai_validate_var = tk.BooleanVar(value=False)
         self.ai_window_var = tk.IntVar(value=5)
         self.flash_sensitivity_var = tk.IntVar(value=15)  # Luma delta threshold for flash detection
-        self.refine_pyscenedetect_var = tk.BooleanVar(value=False)
-        self.refine_snap_var = tk.IntVar(value=6)
-        self.refine_threshold_var = tk.DoubleVar(value=27.0)
 
         # --- Output Action Variables ---
         self.export_csv_var = tk.BooleanVar(value=False)
@@ -657,24 +654,6 @@ class SceneDetectApp:
         flash_spin.grid(row=1, column=3, padx=5, pady=5, sticky="w")
         self._attach_tooltip(flash_spin, "flash_sensitivity")
 
-        # --- Refinement Frame ---
-        refine_frame = ttk.LabelFrame(main_frame, text="Optional: PySceneDetect Refinement")
-        refine_frame.pack(fill=tk.X, padx=5, pady=5)
-        refine_check = ttk.Checkbutton(
-            refine_frame,
-            text="Refine cuts with PySceneDetect (ContentDetector)",
-            variable=self.refine_pyscenedetect_var,
-        )
-        refine_check.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="w")
-        self._attach_tooltip(refine_check, "refine_pyscenedetect")
-        ttk.Label(refine_frame, text="Snap Window (frames):").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-        refine_snap = ttk.Spinbox(refine_frame, from_=0, to=30, textvariable=self.refine_snap_var, width=5)
-        refine_snap.grid(row=1, column=1, padx=5, pady=5, sticky="w")
-        self._attach_tooltip(refine_snap, "refine_snap")
-        ttk.Label(refine_frame, text="Content Threshold:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
-        refine_thr = ttk.Spinbox(refine_frame, from_=5, to=80, increment=1, textvariable=self.refine_threshold_var, width=5)
-        refine_thr.grid(row=2, column=1, padx=5, pady=5, sticky="w")
-        self._attach_tooltip(refine_thr, "refine_threshold")
 
         # --- Output Actions Frame ---
         output_frame = ttk.LabelFrame(main_frame, text="3. Output Actions")
@@ -772,9 +751,6 @@ class SceneDetectApp:
             "ai_validate": self.ai_validate_var.get(),
             "ai_window": self.ai_window_var.get(),
             "flash_sensitivity": self.flash_sensitivity_var.get(),
-            "refine_pyscenedetect": self.refine_pyscenedetect_var.get(),
-            "refine_snap": self.refine_snap_var.get(),
-            "refine_threshold": self.refine_threshold_var.get(),
             "export_csv": self.export_csv_var.get(),
             "export_html": self.export_html_var.get(),
             "export_sc": self.export_sc_var.get(),
@@ -807,9 +783,6 @@ class SceneDetectApp:
             self.ai_validate_var.set(settings.get("ai_validate", False))
             self.ai_window_var.set(settings.get("ai_window", 3))
             self.flash_sensitivity_var.set(settings.get("flash_sensitivity", 15))
-            self.refine_pyscenedetect_var.set(settings.get("refine_pyscenedetect", False))
-            self.refine_snap_var.set(settings.get("refine_snap", 6))
-            self.refine_threshold_var.set(settings.get("refine_threshold", 27.0))
             self.export_csv_var.set(settings.get("export_csv", False))
             self.export_html_var.set(settings.get("export_html", False))
             self.export_sc_var.set(settings.get("export_sc", False))
@@ -1079,12 +1052,7 @@ class SceneDetectApp:
                 self.progress_queue.put((70, "AI validating cuts..."))
                 scenes = self._run_ai_validation(video_path, scenes, guard_len)
 
-            # --- 4. PySceneDetect Refinement (Optional) ---
-            if self.refine_pyscenedetect_var.get() and scenes:
-                self.progress_queue.put((74, "Refining cuts with PySceneDetect..."))
-                scenes = self._refine_with_pyscenedetect(video_path, scenes, fps=fps, total_frames=total_frames)
-
-            # --- 5. Ultra-short Scene Merge (Always On) ---
+            # --- 4. Ultra-short Scene Merge (Always On) ---
             if scenes:
                 scenes = self._merge_ultra_short_scenes(scenes, fps=fps, total_frames=total_frames, max_seconds=0.05)
 
@@ -2492,131 +2460,6 @@ class SceneDetectApp:
             messagebox.showwarning("AI Validation Failed", f"Could not perform AI validation: {e}")
             return scenes
 
-    def _refine_with_pyscenedetect(self, video_path: str, scenes, fps: float, total_frames: int):
-        if not scenes or len(scenes) < 2:
-            return scenes
-
-        snap_window = int(self.refine_snap_var.get() or 0)
-        if snap_window <= 0:
-            return scenes
-
-        try:
-            from scenedetect.detectors import ContentDetector
-        except Exception as e:
-            raise RuntimeError("PySceneDetect is not installed. Install 'scenedetect'.") from e
-
-        refine_threshold = float(self.refine_threshold_var.get() or 27.0)
-        # Collect cuts from PySceneDetect (ContentDetector)
-        logger.info(
-            "PySceneDetect refinement: starting (threshold=%.2f, snap_window=%d)",
-            refine_threshold,
-            snap_window,
-        )
-        cut_frames = []
-
-        try:
-            from scenedetect import open_video, SceneManager
-
-            video = open_video(video_path)
-            scene_manager = SceneManager()
-            try:
-                detector = ContentDetector(threshold=refine_threshold)
-            except TypeError:
-                detector = ContentDetector()
-            scene_manager.add_detector(detector)
-            scene_manager.detect_scenes(video, show_progress=False)
-            scene_list = scene_manager.get_scene_list()
-            if scene_list and len(scene_list) > 1:
-                cut_list = [s[0] for s in scene_list[1:]]
-                cut_frames = [
-                    int(c.get_frames() if hasattr(c, "get_frames") else int(c))
-                    for c in (cut_list or [])
-                ]
-            else:
-                cut_frames = []
-            try:
-                if hasattr(video, "close"):
-                    video.close()
-            except Exception:
-                pass
-        except Exception:
-            # Fallback for older PySceneDetect API
-            from scenedetect.video_manager import VideoManager
-            from scenedetect.scene_manager import SceneManager
-
-            video_manager = VideoManager([video_path])
-            scene_manager = SceneManager()
-            try:
-                detector = ContentDetector(threshold=refine_threshold)
-            except TypeError:
-                detector = ContentDetector()
-            scene_manager.add_detector(detector)
-            video_manager.start()
-            scene_manager.detect_scenes(frame_source=video_manager)
-            scene_list = scene_manager.get_scene_list()
-            if scene_list and len(scene_list) > 1:
-                cut_list = [s[0] for s in scene_list[1:]]
-                cut_frames = [
-                    int(c.get_frames() if hasattr(c, "get_frames") else int(c))
-                    for c in (cut_list or [])
-                ]
-            else:
-                cut_frames = []
-            try:
-                video_manager.release()
-            except Exception:
-                pass
-
-        if not cut_frames:
-            logger.info("PySceneDetect refinement: no cuts found (skipping).")
-            return scenes
-
-        # Normalize + sort
-        cut_frames = sorted(set(int(c) for c in cut_frames if 0 < int(c) < int(total_frames)))
-        logger.info("PySceneDetect refinement: %d candidate cuts.", len(cut_frames))
-
-        # Current cuts from detector
-        orig_cuts = [int(st.get_frames()) for st, _ in scenes[1:]]
-        logger.info("PySceneDetect refinement: %d original cuts.", len(orig_cuts))
-
-        import bisect
-
-        def snap_cut(cut: int) -> int:
-            pos = bisect.bisect_left(cut_frames, cut)
-            candidates = []
-            if pos < len(cut_frames):
-                candidates.append(cut_frames[pos])
-            if pos > 0:
-                candidates.append(cut_frames[pos - 1])
-            if not candidates:
-                return cut
-            nearest = min(candidates, key=lambda x: abs(x - cut))
-            if abs(nearest - cut) <= snap_window:
-                return nearest
-            return cut
-
-        new_cuts = []
-        last = 0
-        snapped = 0
-        for cut in orig_cuts:
-            new_cut = snap_cut(cut)
-            if new_cut != cut:
-                snapped += 1
-                logger.debug("PySceneDetect refinement: snap %d -> %d", cut, new_cut)
-            new_cut = max(new_cut, last + 1)
-            new_cut = min(new_cut, int(total_frames) - 1)
-            new_cuts.append(new_cut)
-            last = new_cut
-        logger.info("PySceneDetect refinement: snapped %d/%d cuts.", snapped, len(orig_cuts))
-
-        # Rebuild scenes
-        out = []
-        start = 0
-        for cut in new_cuts:
-            out.append((Timecode(start, fps), Timecode(cut, fps)))
-            start = cut
-        out.append((Timecode(start, fps), Timecode(total_frames, fps)))
-        return out
 
     def _merge_ultra_short_scenes(self, scenes, fps: float, total_frames: int, max_seconds: float = 0.05):
         """Merge ultra-short scenes into neighbors regardless of validation settings."""
