@@ -1163,7 +1163,12 @@ class SceneDetectApp:
                     # User sensitivity knob: smaller -> more sensitive (merge more flash cuts)
                     self.flash_luma_delta = float(flash_luma_delta)
 
-                    # Rely on the HF image processor for rescale + normalize.
+                    # Extract normalization constants from the HF processor for GPU tensor pipeline.
+                    _img_mean = getattr(self.processor, 'image_mean', None) or [0.485, 0.456, 0.406]
+                    _img_std = getattr(self.processor, 'image_std', None) or [0.229, 0.224, 0.225]
+                    self._dino_mean = torch.tensor(_img_mean, device=self.device).view(1, 3, 1, 1)
+                    self._dino_std = torch.tensor(_img_std, device=self.device).view(1, 3, 1, 1)
+                    self._dino_rescale = float(getattr(self.processor, 'rescale_factor', 1.0 / 255.0))
                     # ---- Optional SSCD (photometric-invariant descriptor) ----
                     self.sscd_model = None
                     self.sscd_input = int(sscd_input)
@@ -1464,115 +1469,99 @@ class SceneDetectApp:
                 def _embed_all_required_frames(self, video_path: str, indices_to_embed, abort_flag=None, progress_cb=None):
                     import cv2
                     import torch
+                    import numpy as np
 
                     indices = sorted(set(int(i) for i in indices_to_embed))
                     if not indices:
                         return
 
-                    self._log.info('Embedding %d unique frames for validation...', len(indices))
-                    indices_set = set(indices)
+                    self._log.info('Embedding %d unique frames via seek-based decode...', len(indices))
 
                     target_size = self._target_size()
                     batch_imgs, batch_ids = [], []
 
-                    use_cuda_decode = True
-                    try:
-                        gpu_frame = cv2.cuda_GpuMat()
-                        cap = cv2.cudacodec.createVideoReader(video_path)
-                    except Exception as e:
-                        use_cuda_decode = False
-                        self._log.warning('CUDA video reader unavailable (falling back to CPU decode): %s', e)
-                        cap = cv2.VideoCapture(video_path)
+                    cap = cv2.VideoCapture(video_path)
+                    if not cap.isOpened():
+                        raise RuntimeError(f'Could not open video for embedding: {video_path}')
+
+                    # --- Group frame indices into consecutive runs ---
+                    # E.g. [10,11,12, 500,501, 8000] -> [(10,[10,11,12]), (500,[500,501]), (8000,[8000])]
+                    runs = []
+                    run_start = indices[0]
+                    current_run = [indices[0]]
+                    for i in range(1, len(indices)):
+                        if indices[i] == current_run[-1] + 1:
+                            current_run.append(indices[i])
+                        else:
+                            runs.append((run_start, current_run))
+                            run_start = indices[i]
+                            current_run = [indices[i]]
+                    runs.append((run_start, current_run))
+
+                    total_frames_to_decode = len(indices)
+                    total_frames_skipped = (indices[-1] - indices[0] + 1) - total_frames_to_decode if len(indices) > 1 else 0
+                    self._log.info(
+                        'Seek-based decode: %d runs covering %d frames (skipping ~%d intermediate frames)',
+                        len(runs), total_frames_to_decode, total_frames_skipped,
+                    )
 
                     def flush_batch():
                         nonlocal batch_imgs, batch_ids
                         if not batch_imgs:
                             return
-                        inputs = self.processor(
-                            images=batch_imgs,
-                            return_tensors='pt',
-                            do_resize=False,
-                            do_center_crop=False,
-                        )
-                        pixel_values = inputs['pixel_values'].to(self.device)
-                        embeddings = self._embed_batch(pixel_values)
+                        # GPU tensor pipeline: bypass HuggingFace processor for speed.
+                        stacked = np.stack(batch_imgs, axis=0)  # (B, H, W, 3) uint8
+                        t = torch.from_numpy(stacked).to(self.device, non_blocking=True)
+                        # (B, H, W, C) -> (B, C, H, W), scale to [0,1]
+                        t = t.permute(0, 3, 1, 2).float() * self._dino_rescale
+                        # ImageNet normalize
+                        t = (t - self._dino_mean) / self._dino_std
+                        embeddings = self._embed_batch(t)
                         for j, fid in enumerate(batch_ids):
                             self.cache[fid] = embeddings[j]
                         batch_imgs, batch_ids = [], []
 
-                    frame_idx = 0
                     wanted_i = 0
                     total_wanted = len(indices)
 
-                    while True:
+                    for run_start_frame, run_frames in runs:
                         if abort_flag is not None and abort_flag.is_set():
                             raise InterruptedError
 
-                        if use_cuda_decode:
-                            ret, gpu_frame = cap.nextFrame(gpu_frame)
-                            if not ret:
-                                break
+                        # Seek to the start of this run
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, run_start_frame)
 
-                            if frame_idx in indices_set:
-                                resized_gpu = cv2.cuda.resize(gpu_frame, target_size)
-                                try:
-                                    rgb_gpu = cv2.cuda.cvtColor(resized_gpu, cv2.COLOR_BGRA2RGB)
-                                except Exception:
-                                    rgb_gpu = cv2.cuda.cvtColor(resized_gpu, cv2.COLOR_BGR2RGB)
+                        for expected_frame in run_frames:
+                            if abort_flag is not None and abort_flag.is_set():
+                                raise InterruptedError
 
-                                rgb = rgb_gpu.download()
-
-                                if rgb.ndim == 3 and rgb.shape[2] == 4:
-                                    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGRA2RGB)
-                                elif not (rgb.ndim == 3 and rgb.shape[2] == 3):
-                                    frame_idx += 1
-                                    continue
-
-                                luma = self._luma_from_rgb(rgb)
-                                hist, v_hi = self._hsv_hist_and_vhi_from_rgb(rgb)
-
-                                self.luma_cache[frame_idx] = luma
-                                self.vhi_cache[frame_idx] = v_hi
-                                self.hist_cache[frame_idx] = hist
-
-                                batch_imgs.append(rgb)
-                                batch_ids.append(frame_idx)
-                                wanted_i += 1
-                        else:
                             ret, frame = cap.read()
-                            if not ret:
-                                break
+                            if not ret or frame is None:
+                                self._log.debug('Failed to read frame %d, skipping.', expected_frame)
+                                continue
 
-                            if frame_idx in indices_set:
-                                frame = cv2.resize(frame, target_size)
-                                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            frame = cv2.resize(frame, target_size)
+                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                                luma = self._luma_from_rgb(rgb)
-                                hist, v_hi = self._hsv_hist_and_vhi_from_rgb(rgb)
+                            luma = self._luma_from_rgb(rgb)
+                            hist, v_hi = self._hsv_hist_and_vhi_from_rgb(rgb)
 
-                                self.luma_cache[frame_idx] = luma
-                                self.vhi_cache[frame_idx] = v_hi
-                                self.hist_cache[frame_idx] = hist
+                            self.luma_cache[expected_frame] = luma
+                            self.vhi_cache[expected_frame] = v_hi
+                            self.hist_cache[expected_frame] = hist
 
-                                batch_imgs.append(rgb)
-                                batch_ids.append(frame_idx)
-                                wanted_i += 1
+                            batch_imgs.append(rgb)
+                            batch_ids.append(expected_frame)
+                            wanted_i += 1
 
-                        if len(batch_imgs) >= self.batch_size:
-                            flush_batch()
+                            if len(batch_imgs) >= self.batch_size:
+                                flush_batch()
 
-                        if progress_cb and total_wanted > 0 and frame_idx % 50 == 0:
-                            progress_cb(min(1.0, wanted_i / total_wanted), f'Embedding frames ({wanted_i}/{total_wanted})')
-
-                        frame_idx += 1
+                            if progress_cb and total_wanted > 0 and wanted_i % 25 == 0:
+                                progress_cb(min(1.0, wanted_i / total_wanted), f'Embedding frames ({wanted_i}/{total_wanted})')
 
                     flush_batch()
-
-                    try:
-                        if hasattr(cap, 'release'):
-                            cap.release()
-                    except Exception:
-                        pass
+                    cap.release()
 
                     self._log.info('Frame embedding complete (%d cached).', len(self.cache))
 
