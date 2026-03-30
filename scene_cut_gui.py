@@ -301,7 +301,9 @@ def _autoshot_frame_generator(video_path: str, width: int = 48, height: int = 27
     
     frame_size = width * height * 3
     cmd = [
-        "ffmpeg", "-v", "error", "-i", video_path,
+        "ffmpeg", "-v", "error", 
+        "-vsync", "0",          # Force frame-exact passthrough
+        "-i", video_path,
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", f"{width}x{height}", "-"
     ]
@@ -532,6 +534,7 @@ class SceneDetectApp:
             "TransNetV2": self._default_detector_params("TransNetV2"),
         }
         self._last_detector_type = self.detector_type_var.get()
+        self.snap_cuts_var = tk.BooleanVar(value=True)
         self.ai_validate_var = tk.BooleanVar(value=False)
         self.ai_window_var = tk.IntVar(value=5)
         self.flash_sensitivity_var = tk.IntVar(value=15)  # Luma delta threshold for flash detection
@@ -544,6 +547,7 @@ class SceneDetectApp:
         self.split_video_var = tk.BooleanVar(value=False)
         self.num_images_var = tk.IntVar(value=3)
         self.frame_margin_var = tk.IntVar(value=1)
+        self.sc_offset_var = tk.IntVar(value=0)
 
         # --- FFmpeg Variables ---
         self.ffmpeg_codec_var = tk.StringVar(value="h264_nvenc")
@@ -638,20 +642,25 @@ class SceneDetectApp:
 
         self._build_detector_params() # Initial build
 
-        # --- AI Validation Frame ---
-        ai_frame = ttk.LabelFrame(main_frame, text="Optional: AI Validation")
+        # --- AI & Refinements Frame ---
+        ai_frame = ttk.LabelFrame(main_frame, text="Optional: Refinements & Validation")
         ai_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        snap_check = ttk.Checkbutton(ai_frame, text="Snap cuts to frame-perfect boundary (Fixes +/- 2 frame AI inaccuracies)", variable=self.snap_cuts_var)
+        snap_check.grid(row=0, column=0, columnspan=4, padx=5, pady=5, sticky="w")
+        self._attach_tooltip(snap_check, "snap_cuts")
+
         ai_check = ttk.Checkbutton(ai_frame, text="Validate cuts with DINOv3/SSCD (filters flashes/fast motion)", variable=self.ai_validate_var)
-        ai_check.grid(row=0, column=0, columnspan=3, padx=5, pady=5, sticky="w")
+        ai_check.grid(row=1, column=0, columnspan=4, padx=5, pady=5, sticky="w")
         self._attach_tooltip(ai_check, "ai_validate")
-        ttk.Label(ai_frame, text="Validation Window (frames):").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        ttk.Label(ai_frame, text="Validation Window (frames):").grid(row=2, column=0, padx=5, pady=5, sticky="w")
         ai_spin = ttk.Spinbox(ai_frame, from_=2, to=10, textvariable=self.ai_window_var, width=5)
-        ai_spin.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        ai_spin.grid(row=2, column=1, padx=5, pady=5, sticky="w")
         self._attach_tooltip(ai_spin, "ai_window")
         
-        ttk.Label(ai_frame, text="Flash Sensitivity:").grid(row=1, column=2, padx=(20, 5), pady=5, sticky="w")
+        ttk.Label(ai_frame, text="Flash Sensitivity:").grid(row=2, column=2, padx=(20, 5), pady=5, sticky="w")
         flash_spin = ttk.Spinbox(ai_frame, from_=10, to=80, textvariable=self.flash_sensitivity_var, width=5)
-        flash_spin.grid(row=1, column=3, padx=5, pady=5, sticky="w")
+        flash_spin.grid(row=2, column=3, padx=5, pady=5, sticky="w")
         self._attach_tooltip(flash_spin, "flash_sensitivity")
 
 
@@ -662,6 +671,12 @@ class SceneDetectApp:
         c1 = ttk.Checkbutton(output_frame, text="Export scene list to CSV", variable=self.export_csv_var); c1.grid(row=0, column=0, sticky="w", padx=5, pady=2)
         c2 = ttk.Checkbutton(output_frame, text="Export scene list to HTML", variable=self.export_html_var); c2.grid(row=1, column=0, sticky="w", padx=5, pady=2)
         c3 = ttk.Checkbutton(output_frame, text="Export to .sc file", variable=self.export_sc_var); c3.grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        
+        ttk.Label(output_frame, text="SC Offset:").grid(row=2, column=1, sticky="w", padx=(20, 5), pady=2)
+        sc_off_spin = ttk.Spinbox(output_frame, from_=-5, to=5, textvariable=self.sc_offset_var, width=5)
+        sc_off_spin.grid(row=2, column=2, sticky="w", padx=5, pady=2)
+        self._attach_tooltip(sc_off_spin, "sc_offset")
+
         c5 = ttk.Checkbutton(output_frame, text="Save scene thumbnails", variable=self.save_images_var); c5.grid(row=0, column=1, sticky="w", padx=20, pady=2)
         c6 = ttk.Checkbutton(output_frame, text="Split video into scenes (FFmpeg)", variable=self.split_video_var); c6.grid(row=1, column=1, sticky="w", padx=20, pady=2)
         self._attach_tooltip(c1, "export_csv"); self._attach_tooltip(c2, "export_html"); self._attach_tooltip(c3, "export_sc")
@@ -748,6 +763,7 @@ class SceneDetectApp:
             "output_dir": self.output_dir_var.get(),
             "detector_type": self.detector_type_var.get(),
             "detector_params": self.detector_params_cache,
+            "snap_cuts": self.snap_cuts_var.get(),
             "ai_validate": self.ai_validate_var.get(),
             "ai_window": self.ai_window_var.get(),
             "flash_sensitivity": self.flash_sensitivity_var.get(),
@@ -758,6 +774,7 @@ class SceneDetectApp:
             "split_video": self.split_video_var.get(),
             "num_images": self.num_images_var.get(),
             "frame_margin": self.frame_margin_var.get(),
+            "sc_offset": self.sc_offset_var.get(),
             "ffmpeg_codec": self.ffmpeg_codec_var.get(),
             "ffmpeg_preset": self.ffmpeg_preset_var.get(),
             "ffmpeg_cq": self.ffmpeg_cq_var.get(),
@@ -780,6 +797,7 @@ class SceneDetectApp:
             self.video_path_var.set(settings.get("video_path", ""))
             self.output_dir_var.set(settings.get("output_dir", ""))
             
+            self.snap_cuts_var.set(settings.get("snap_cuts", True))
             self.ai_validate_var.set(settings.get("ai_validate", False))
             self.ai_window_var.set(settings.get("ai_window", 3))
             self.flash_sensitivity_var.set(settings.get("flash_sensitivity", 15))
@@ -790,6 +808,7 @@ class SceneDetectApp:
             self.split_video_var.set(settings.get("split_video", False))
             self.num_images_var.set(settings.get("num_images", 3))
             self.frame_margin_var.set(settings.get("frame_margin", 1))
+            self.sc_offset_var.set(settings.get("sc_offset", 0))
             self.ffmpeg_codec_var.set(settings.get("ffmpeg_codec", "h264_nvenc"))
             self.ffmpeg_preset_var.set(settings.get("ffmpeg_preset", "p7"))
             self.ffmpeg_cq_var.set(settings.get("ffmpeg_cq", 16))
@@ -1047,7 +1066,11 @@ class SceneDetectApp:
 
             logger.info("Detected %d raw scenes (%s)", len(scenes), detector_type)
 
-            # --- 3. AI Validation (Optional) ---
+            # --- 3. Optional Refinements ---
+            if self.snap_cuts_var.get() and scenes:
+                self.progress_queue.put((65, "Snapping cuts to exact frames..."))
+                scenes = self._snap_cuts_to_exact_pixel_diff(video_path, scenes, search_radius=2)
+                
             if self.ai_validate_var.get() and scenes:
                 self.progress_queue.put((70, "AI validating cuts..."))
                 scenes = self._run_ai_validation(video_path, scenes, guard_len)
@@ -1069,7 +1092,7 @@ class SceneDetectApp:
             output_tasks: List[Tuple[tk.BooleanVar, str, Callable]] = [
                 (self.export_csv_var, "CSV", lambda: self._export_csv(Path(output_dir) / f"{base_name}_scenes.csv")),
                 (self.export_html_var, "HTML", lambda: self._export_html(Path(output_dir) / f"{base_name}_scenes.html")),
-                (self.export_sc_var, "SC", lambda: self._export_sc(fps, total_frames, Path(output_dir) / f"{base_name}.sc")),
+                (self.export_sc_var, "SC", lambda: self._export_sc(fps, total_frames, Path(output_dir) / f"{base_name}.sc", self.sc_offset_var.get())),
                 (self.save_images_var, "Images", lambda: self._save_images(video_path, output_dir, fps)),
                 (self.split_video_var, "Splitting", lambda: self._split_video(video_path, output_dir, fps)),
             ]
@@ -1088,6 +1111,88 @@ class SceneDetectApp:
             logger.exception("Fatal error during task execution.")
             messagebox.showerror("Processing Error", str(err))
             self.progress_queue.put((0, "Error."))
+
+    def _snap_cuts_to_exact_pixel_diff(self, video_path: str, scenes: list[tuple[Timecode, Timecode]], search_radius: int = 2) -> list[tuple[Timecode, Timecode]]:
+        """Refines cut boundaries by finding the exact frame with maximum visual disruption within a small local search window."""
+        import cv2
+        import numpy as np
+
+        if len(scenes) < 2:
+            return scenes
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logger.warning("Could not open video to snap cuts. Returning original scenes.")
+            return scenes
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        
+        # We only need to adjust the boundaries between scenes
+        cut_frames = []
+        for _, end_tc in scenes[:-1]:
+            cut_frames.append(int(end_tc.get_frames()))
+            
+        snapped_cuts = []
+            
+        for i, cut in enumerate(cut_frames):
+            if self.abort_flag.is_set():
+                break
+
+            # Search window: [cut - radius - 1, cut + radius]
+            start_search = max(0, cut - search_radius - 1)
+            end_search = cut + search_radius
+            if total_frames > 0:
+                end_search = min(total_frames - 1, end_search)
+            
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_search)
+            frames_cache = {}
+            for f in range(start_search, end_search + 1):
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    # Resize very small for ultra-fast, robust mean difference
+                    frames_cache[f] = cv2.resize(frame, (64, 36))
+                
+            max_diff = -1.0
+            best_cut = cut
+            
+            for f in range(max(1, cut - search_radius), end_search + 1):
+                prev_f = frames_cache.get(f - 1)
+                curr_f = frames_cache.get(f)
+                if prev_f is not None and curr_f is not None:
+                    diff = np.mean(np.abs(curr_f.astype(np.float32) - prev_f.astype(np.float32)))
+                    if diff > max_diff:
+                        max_diff = float(diff)
+                        best_cut = f
+                        
+            snapped_cuts.append(best_cut)
+            
+            if self.progress_queue and i % 20 == 0:
+                self.progress_queue.put((65 + (i/len(cut_frames))*4.0, f"Snapping cuts to perfect frame ({i+1}/{len(cut_frames)})"))
+
+        cap.release()
+        
+        if not snapped_cuts:
+            return scenes
+            
+        fps = scenes[0][0].fps
+        snapped_scenes = []
+        cur_start = scenes[0][0].get_frames()
+        
+        for new_cut in snapped_cuts:
+            if new_cut <= cur_start:
+                new_cut = cur_start + 1 
+            snapped_scenes.append((Timecode(cur_start, fps), Timecode(new_cut, fps)))
+            cur_start = new_cut
+            
+        final_end = scenes[-1][1].get_frames()
+        if final_end <= cur_start:
+            final_end = cur_start + 1
+            if total_frames > 0 and final_end > total_frames:
+                final_end = total_frames
+        snapped_scenes.append((Timecode(cur_start, fps), Timecode(final_end, fps)))
+        
+        logger.info("Pixel snapping adjusted %d boundaries to their exact maximum visual difference.", len(snapped_cuts))
+        return snapped_scenes
 
     def _run_ai_validation(self, video_path, scenes, short_guard_frames: int):
         try:
@@ -2576,7 +2681,7 @@ class SceneDetectApp:
         filename.write_text(html, encoding="utf-8")
         logger.info("Exported scene list to HTML: %s", filename)
 
-    def _export_sc(self, fps: float, total_frames: int, filename: Path):
+    def _export_sc(self, fps: float, total_frames: int, filename: Path, offset: int = 0):
         """Export a .sc file (same frame-value format as before)."""
         if not self.detected_scenes:
             return
@@ -2589,7 +2694,7 @@ class SceneDetectApp:
 
         # Mark cut frames (skip first scene start at 0)
         for start_tc, _ in self.detected_scenes[1:]:
-            cut_frame = int(start_tc.get_frames())
+            cut_frame = int(start_tc.get_frames()) + offset
             if 0 <= cut_frame < total_frames:
                 frame_values[cut_frame] = 255
                 last_cut_frame = max(last_cut_frame, cut_frame)
