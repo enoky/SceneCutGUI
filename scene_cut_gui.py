@@ -743,11 +743,11 @@ class SceneDetectApp:
         self.root.destroy()
 
     def _default_detector_params(self, detector_type: str) -> dict[str, str]:
-        threshold = "0.296" if detector_type == "AutoShot" else "0.3"
+        threshold = "0.24" if detector_type == "AutoShot" else "0.3"
         return {
             "device": "auto",
             "threshold": threshold,
-            "min_scene_len": "8",
+            "min_scene_len": "12",
         }
 
     def _cache_detector_params(self, detector_type: str | None) -> None:
@@ -1051,18 +1051,40 @@ class SceneDetectApp:
             else:
                 raise RuntimeError(f"Unknown detector type: {detector_type}")
 
-            # Enforce minimum scene length (frames), but preserve very short scenes by default.
+            # Enforce minimum scene length (frames) by merging short scenes
+            # into neighbours (not dropping them, which would create timeline gaps).
             min_len = int(detector.get("min_scene_len", 1) or 1)
             guard_len = short_scene_guard_frames(fps)
-            if min_len > 1 and scenes:
-                filtered = []
-                for st, et in scenes:
-                    scene_len = int(et.get_frames() - st.get_frames())
-                    if scene_len < min_len and scene_len > guard_len:
+            if min_len > 1 and scenes and len(scenes) > 1:
+                frames = [[int(st.get_frames()), int(et.get_frames())] for st, et in scenes]
+                i = 0
+                while i < len(frames) and len(frames) > 1:
+                    seg_len = frames[i][1] - frames[i][0]
+                    if seg_len >= min_len:
+                        i += 1
                         continue
-                    filtered.append((st, et))
-                # Keep at least one
-                scenes = filtered or [scenes[0]]
+                    # Merge into a neighbour
+                    if i == 0:
+                        frames[1][0] = frames[0][0]
+                        del frames[0]
+                        continue  # re-check index 0
+                    if i == len(frames) - 1:
+                        frames[i - 1][1] = frames[i][1]
+                        del frames[i]
+                        i = max(0, i - 1)
+                        continue
+                    # Middle scene: merge into the shorter neighbour
+                    prev_len = frames[i - 1][1] - frames[i - 1][0]
+                    next_len = frames[i + 1][1] - frames[i + 1][0]
+                    if prev_len >= next_len:
+                        frames[i - 1][1] = frames[i][1]
+                        del frames[i]
+                        i = max(0, i - 1)
+                    else:
+                        frames[i + 1][0] = frames[i][0]
+                        del frames[i]
+                    continue
+                scenes = [(Timecode(s, fps), Timecode(e, fps)) for s, e in frames]
 
             logger.info("Detected %d raw scenes (%s)", len(scenes), detector_type)
 
@@ -1724,7 +1746,7 @@ class SceneDetectApp:
                     p90 = float(np.percentile(s, 90))
 
                     thr = max(p75, min(t_otsu, p90))
-                    return float(np.clip(thr, 0.84, 0.94))
+                    return float(np.clip(thr, 0.80, 0.94))
 
                 def _window_indices(self, cut_frame: int, window: int, gap: int, total_frames: int):
                     pre_end = max(0, cut_frame - gap)
@@ -2146,7 +2168,7 @@ class SceneDetectApp:
                         )
                         mot_amb = (float(motion) >= 0.20) and (float(s_raw) >= float(base_thr) - 0.08)
                         high_sim_non_flash = float(s_raw) >= float(base_thr) + 0.01
-                        ambiguous_non_flash = bool(near_thr or adj_amb or pix_amb or mot_amb or high_sim_non_flash)
+                        ambiguous_non_flash = bool(near_thr or adj_amb or mot_amb)
 
                     # Evaluate SSCD for flash cuts or ambiguous/high-sim non-flash cuts.
                     if (s_sscd is None) and (video_path is not None) and (getattr(self, 'sscd_model', None) is not None):
@@ -2160,37 +2182,37 @@ class SceneDetectApp:
 
                     # 1) Flash path: default MERGE on confident flash unless strong cut evidence exists.
                     if is_flash:
-                        # Lower confidence threshold to favor merging flashes.
-                        min_flash_conf = 0.40
+                        # Higher confidence threshold to prevent false merges
+                        min_flash_conf = 0.55
                         if s_sscd is not None:
-                            min_flash_conf = 0.35
+                            min_flash_conf = 0.45
 
-                        # Strong cut evidence overrides flash-merge default, but be very conservative.
-                        low_cut_thr = max(0.48, min(0.64, float(base_thr) - 0.26 - 0.12 * motion))
+                        # Strong cut evidence overrides flash-merge default
+                        low_cut_thr = max(0.60, min(0.74, float(base_thr) - 0.16 - 0.08 * motion))
                         s_cut = float(min(s_raw, s_stable))
                         strong_signals = 0
 
-                        if (s_adj is not None) and (float(s_adj) < (self.ADJ_STRONG_CUT - 0.12)):
+                        if (s_adj is not None) and (float(s_adj) < (self.ADJ_STRONG_CUT - 0.04)):
                             strong_signals += 1
                         if s_cut < low_cut_thr:
                             strong_signals += 1
-                        if (pixel_sim is not None) and (float(pixel_sim) < 0.025):
+                        if (pixel_sim is not None) and (float(pixel_sim) < 0.06):
                             strong_signals += 1
                         if s_sscd is not None:
                             try:
-                                if float(s_sscd) < 0.55:
+                                if float(s_sscd) < 0.62:
                                     strong_signals += 1
                             except Exception:
                                 pass
 
-                        # Require multiple strong indicators before keeping a flash cut.
+                        # Require fewer strong indicators before keeping a flash cut.
                         # Fix: Don't allow low s_cut (windowed) to force a KEEP if s_adj is high (meaning immediate neighbors are similar)
-                        s_cut_force = (s_cut < (low_cut_thr - 0.10))
-                        if (s_adj is not None) and (float(s_adj) >= 0.70):
+                        s_cut_force = (s_cut < (low_cut_thr - 0.08))
+                        if (s_adj is not None) and (float(s_adj) >= 0.78):
                             s_cut_force = False
 
-                        strong_cut = (strong_signals >= 3) or (
-                            (s_adj is not None and float(s_adj) < (self.ADJ_STRONG_CUT - 0.20))
+                        strong_cut = (strong_signals >= 2) or (
+                            (s_adj is not None and float(s_adj) < (self.ADJ_STRONG_CUT - 0.10))
                         ) or s_cut_force
 
                         if flash_conf >= min_flash_conf:
@@ -2233,10 +2255,10 @@ class SceneDetectApp:
                     # 2b) Non-flash moderate continuity merge: reduce false keeps
                     if decision_keep and (not is_flash) and (not sscd_decision_lock):
                         mid_cont = (
-                            (cont >= 0.87)
-                            and ((s_adj is None) or (float(s_adj) >= 0.83))
-                            and (s_raw >= (float(base_thr) - 0.18))
-                            and ((pixel_sim is None) or (float(pixel_sim) >= 0.10))
+                            (cont >= 0.92)
+                            and ((s_adj is None) or (float(s_adj) >= 0.88))
+                            and (s_raw >= (float(base_thr) - 0.06))
+                            and ((pixel_sim is not None) and (float(pixel_sim) >= 0.16))
                         )
                         if mid_cont:
                             decision_keep = False
@@ -2245,34 +2267,28 @@ class SceneDetectApp:
                             # High pixel similarity can override lower s_raw when continuity is strong.
                             hi_pix_merge = (
                                 (pixel_sim is not None)
-                                and (float(pixel_sim) >= 0.16)
-                                and (cont >= 0.85)
-                                and ((s_adj is None) or (float(s_adj) >= 0.80))
-                                and (s_raw >= (float(base_thr) - 0.26))
+                                and (float(pixel_sim) >= 0.22)
+                                and (cont >= 0.90)
+                                and ((s_adj is None) or (float(s_adj) >= 0.86))
+                                and (s_raw >= (float(base_thr) - 0.14))
                             )
                             if hi_pix_merge:
                                 decision_keep = False
                                 reason = 'merge_same_shot_pixel'
 
                     # 2c) Non-flash high-continuity merge: reduce false keeps
-                    if decision_keep and (not is_flash):
+                    if decision_keep and (not is_flash) and (not sscd_decision_lock):
                         high_cont = (
-                            (cont >= 0.90)
-                            and ((s_adj is None) or (float(s_adj) >= 0.88))
-                            and (s_raw >= (float(base_thr) - 0.12))
-                            and ((pixel_sim is None) or (float(pixel_sim) >= 0.10))
+                            (cont >= 0.94)
+                            and ((s_adj is None) or (float(s_adj) >= 0.92))
+                            and (s_raw >= (float(base_thr) - 0.03))
+                            and ((pixel_sim is not None) and (float(pixel_sim) >= 0.16))
                         )
                         if high_cont:
                             decision_keep = False
                             reason = 'merge_same_shot_continuity'
                             
-                    # 2d) High Adjacent Merge: Trust DINO adjacent if very high (handles missed flashes/strobes)
-                    if decision_keep and (not is_flash):
-                         if (s_adj is not None) and (float(s_adj) >= float(base_thr)):
-                             # Only Keep if pixel evidence is overwhelmingly for a cut? 
-                             # No, trust DINO. Histograms fail on lighting changes.
-                             decision_keep = False
-                             reason = 'merge_high_adj_dino'
+                    # 2d) Removed: High Adjacent Merge was causing false positives
 
                     # 3) Non-flash: strong adjacent discontinuity => KEEP (unless SSCD decided)
                     if (not sscd_decision_lock) and decision_keep and (s_adj is not None) and (float(s_adj) < self.ADJ_STRONG_CUT):
@@ -2478,12 +2494,13 @@ class SceneDetectApp:
                                 boundary_cache[cut_frame] = info
                                 return info
 
-                            ultra_short_frames = max(1, int(round(float(fps_local) * 0.05))) if fps_local > 0 else 1
+                            ultra_short_frames = max(1, int(round(float(fps_local) * 0.04))) if fps_local > 0 else 1
                             i = 1
                             merged_any = False
                             while i < len(frames) - 1:
                                 seg_len = int(frames[i][1] - frames[i][0])
-                                if seg_len <= int(short_guard_frames):
+                                guard_len = max(2, int(round(float(fps_local) * 0.12))) if fps_local > 0 else 2
+                                if seg_len <= guard_len:
                                     info_pre = boundary_info(frames[i][0])
                                     info_post = boundary_info(frames[i][1])
                                     force_merge = seg_len <= ultra_short_frames
