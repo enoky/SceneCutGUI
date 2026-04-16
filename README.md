@@ -1,6 +1,6 @@
 # SceneCutGUI
 
-A modern, GPU-accelerated scene detection and video slicing tool with an intuitive Tkinter GUI. Uses **AutoShot** or **TransNetV2** neural networks for highly accurate shot boundary detection, with optional **DINOv3-based AI validation** to filter false positives.
+A modern, GPU-accelerated scene detection and video slicing tool with an intuitive Tkinter GUI. Uses **AutoShot** or **TransNetV2** neural networks for highly accurate shot boundary detection, with optional **DINOv3/TIPSv2-based AI validation** to filter false positives.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -11,7 +11,7 @@ A modern, GPU-accelerated scene detection and video slicing tool with an intuiti
 ## ✨ Features
 
 - **AutoShot / TransNetV2 Detection** — State-of-the-art neural networks for shot boundary detection
-- **DINOv3/SSCD AI Validation** — Optional post-processing to filter out flashes, fast motion, and near-black false positives
+- **DINOv3/TIPSv2/SSCD AI Validation** — Optional post-processing to filter out flashes, fast motion, and near-black false positives
 - **GPU Acceleration** — CUDA support for both video decoding (OpenCV) and model inference (PyTorch)
 - **Multiple Export Formats**:
   - CSV scene list
@@ -39,6 +39,7 @@ torchaudio
 einops
 transnetv2-pytorch
 transformers
+sentencepiece
 numpy
 opencv-contrib-python with CUDA (see link below)
 ```
@@ -83,14 +84,13 @@ pip install opencv_contrib_python-4.13.0.90-cp37-abi3-win_amd64.whl
 
 <a href="https://drive.google.com/file/d/1aJ96eJE4DstJ_HBzAusuYLvfU01Jnc92/view?usp=sharing">Download</a> the model checkpoints to the `weights/` directory:
 
-| File                             | Description                      |
-| -------------------------------- | -------------------------------- |
-| `ckpt_0_200_0.pth`               | AutoShot model weights           |
-| `transnetv2-pytorch-weights.pth` | TransNetV2 model weights         |
-| `model.safetensors`              | DINOv3 model (for AI validation) |
-| `config.json`                    | DINOv3 model config              |
-| `preprocessor_config.json`       | DINOv3 preprocessor config       |
-| `sscd_disc_large.torchscript.pt` | SSCD model (for AI validation)   |
+| File                             | Description                                 |
+| -------------------------------- | ------------------------------------------- |
+| `ckpt_0_200_0.pth`               | AutoShot model weights                      |
+| `transnetv2-pytorch-weights.pth` | TransNetV2 model weights                    |
+| `DINOv3/*`                       | DINOv3 model (for AI validation)            |
+| `TIPSv2/*`                       | TIPSv2 model (for AI validation)            |
+| `sscd_disc_large.torchscript.pt` | SSCD model (for AI validation)              |
 
 ---
 
@@ -133,11 +133,12 @@ RUN_SceneCutGUI.bat
 
 ### AI Validation (Optional)
 
-| Parameter           | Default | Description                                    |
-| ------------------- | ------- | ---------------------------------------------- |
-| `ai_validate`       | `false` | Enable DINOv3/SSCD validation                  |
-| `ai_window`         | `5`     | Frames before/after cut to analyze             |
-| `flash_sensitivity` | `15`    | Luma delta threshold for flash detection       |
+| Parameter           | Default  | Description                                    |
+| ------------------- | -------- | ---------------------------------------------- |
+| `ai_validate`       | `false`  | Enable DINOv3/TIPSv2/SSCD validation           |
+| `ai_val_model`      | `DINOv3` | Model used for validation (DINOv3 or TIPSv2)   |
+| `ai_window`         | `5`      | Frames before/after cut to analyze             |
+| `flash_sensitivity` | `15`     | Luma delta threshold for flash detection       |
 
 ### Image & Thumbnail Settings
 
@@ -174,9 +175,9 @@ RUN_SceneCutGUI.bat
 
 AutoShot and TransNetV2 are deep learning models trained for shot boundary detection. Use the detector selector in the GUI to switch between them based on your content and performance needs.
 
-### DINOv3 AI Validation
+### DINOv3 / TIPSv2 AI Validation
 
-The optional validation step uses a DINOv3 vision transformer to:
+The optional validation step uses a vision transformer (such as DINOv3 or TIPSv2) to:
 
 - Sample frames before and after each detected cut
 - Compute visual embeddings and similarity scores
@@ -209,4 +210,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [transnetv2-pytorch](https://pypi.org/project/transnetv2-pytorch/) ? PyTorch implementation
 - [AutoShot](https://github.com/wentaozhu/AutoShot) — Shot boundary detection model
 - [DINOv3](https://github.com/facebookresearch/dinov3) — Vision transformer for validation
+- [TIPSv2](https://github.com/google-deepmind/tips) — Vision language multimodal foundation model
 - [FFmpeg](https://ffmpeg.org/) — Video processing backend

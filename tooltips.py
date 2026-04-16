@@ -40,7 +40,8 @@ TOOLTIPS: dict[str, str] = {
     "lowpass": "Amount of smoothing applied before hashing. Helps ignore minor visual noise.",
     
     # AI Validation
-    "ai_validate": "Use a DINOv3 model to validate cuts and filter out flashes/fast motion. Requires a CUDA-enabled GPU.",
+    "ai_validate": "Use AI validation to validate cuts and filter out flashes/fast motion. Requires a CUDA-enabled GPU.",
+    "ai_val_model": "Select the AI model used for validation (DINOv3 or TIPSv2).",
     "ai_window": "Number of frames before and after a cut to analyze for AI validation.",
     "flash_sensitivity": "Sensitivity for detecting flash spikes versus scene cuts. Lower values (15-25) detect flashes more aggressively. Default: 15.",
     

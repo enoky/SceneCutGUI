@@ -536,6 +536,7 @@ class SceneDetectApp:
         self._last_detector_type = self.detector_type_var.get()
         self.snap_cuts_var = tk.BooleanVar(value=True)
         self.ai_validate_var = tk.BooleanVar(value=False)
+        self.ai_val_model_var = tk.StringVar(value="DINOv3")
         self.ai_window_var = tk.IntVar(value=5)
         self.flash_sensitivity_var = tk.IntVar(value=15)  # Luma delta threshold for flash detection
 
@@ -650,9 +651,13 @@ class SceneDetectApp:
         snap_check.grid(row=0, column=0, columnspan=4, padx=5, pady=5, sticky="w")
         self._attach_tooltip(snap_check, "snap_cuts")
 
-        ai_check = ttk.Checkbutton(ai_frame, text="Validate cuts with DINOv3/SSCD (filters flashes/fast motion)", variable=self.ai_validate_var)
-        ai_check.grid(row=1, column=0, columnspan=4, padx=5, pady=5, sticky="w")
+        ai_check = ttk.Checkbutton(ai_frame, text="Validate cuts with AI:", variable=self.ai_validate_var)
+        ai_check.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="w")
         self._attach_tooltip(ai_check, "ai_validate")
+        
+        ai_combo = ttk.Combobox(ai_frame, textvariable=self.ai_val_model_var, values=["DINOv3", "TIPSv2"], state="readonly", width=10)
+        ai_combo.grid(row=1, column=2, padx=5, pady=5, sticky="w")
+        self._attach_tooltip(ai_combo, "ai_val_model")
         ttk.Label(ai_frame, text="Validation Window (frames):").grid(row=2, column=0, padx=5, pady=5, sticky="w")
         ai_spin = ttk.Spinbox(ai_frame, from_=2, to=10, textvariable=self.ai_window_var, width=5)
         ai_spin.grid(row=2, column=1, padx=5, pady=5, sticky="w")
@@ -765,6 +770,7 @@ class SceneDetectApp:
             "detector_params": self.detector_params_cache,
             "snap_cuts": self.snap_cuts_var.get(),
             "ai_validate": self.ai_validate_var.get(),
+            "ai_val_model": self.ai_val_model_var.get(),
             "ai_window": self.ai_window_var.get(),
             "flash_sensitivity": self.flash_sensitivity_var.get(),
             "export_csv": self.export_csv_var.get(),
@@ -799,6 +805,7 @@ class SceneDetectApp:
             
             self.snap_cuts_var.set(settings.get("snap_cuts", True))
             self.ai_validate_var.set(settings.get("ai_validate", False))
+            self.ai_val_model_var.set(settings.get("ai_val_model", "DINOv3"))
             self.ai_window_var.set(settings.get("ai_window", 3))
             self.flash_sensitivity_var.set(settings.get("flash_sensitivity", 15))
             self.export_csv_var.set(settings.get("export_csv", False))
@@ -1256,7 +1263,7 @@ class SceneDetectApp:
                 BOLD = "\033[1m"
                 RESET = "\033[0m"
 
-                def __init__(self, model_dir: str = './weights', device=None, batch_size: int = 48,
+                def __init__(self, model_dir: str = './weights/DINOv3', val_model: str = 'DINOv3', device=None, batch_size: int = 48,
                              flash_luma_delta: float = 30.0,
                              enable_sscd: bool = True, sscd_model_path: str = None, sscd_input: int = 288,
                              logger=None):
@@ -1266,17 +1273,48 @@ class SceneDetectApp:
                     from transformers import AutoImageProcessor, AutoModel
 
                     self._log = logger or logging.getLogger('DinoCutValidator')
+                    self.val_model = val_model
 
                     if not os.path.isdir(model_dir):
-                        raise FileNotFoundError(f'DINOv3 model directory not found: {model_dir}')
+                        raise FileNotFoundError(f'{self.val_model} model directory not found: {model_dir}')
 
                     self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
                     if self.device == 'cpu':
                         raise RuntimeError('AI Validation requires a CUDA-enabled GPU and PyTorch.')
 
-                    self._log.debug('Loading DINOv3 model on device: %s', self.device)
-                    self.processor = AutoImageProcessor.from_pretrained(model_dir, local_files_only=True)
-                    self.model = AutoModel.from_pretrained(model_dir, local_files_only=True).to(self.device).eval()
+                    self._log.debug('Loading %s model on device: %s', self.val_model, self.device)
+                    if self.val_model == "TIPSv2":
+                        self.processor = None
+                        import sys
+                        import importlib
+                        # Package loading to bypass relative import errors and HF hub downloading issues
+                        model_dir_abs = os.path.abspath(model_dir)
+                        parent_dir = os.path.dirname(model_dir_abs)
+                        pkg_name = os.path.basename(model_dir_abs)
+                        
+                        init_file = os.path.join(model_dir_abs, "__init__.py")
+                        if not os.path.exists(init_file):
+                            try:
+                                with open(init_file, 'w') as f: pass
+                            except OSError:
+                                pass
+                                
+                        sys.path.insert(0, parent_dir)
+                        try:
+                            # Dynamic module import as a package enables relative imports within modeling_tips to work
+                            mod_cfg = importlib.import_module(f"{pkg_name}.configuration_tips")
+                            mod_mdl = importlib.import_module(f"{pkg_name}.modeling_tips")
+                            config = mod_cfg.TIPSv2Config.from_pretrained(model_dir)
+                            self.model = mod_mdl.TIPSv2Model.from_pretrained(model_dir, config=config).to(self.device).eval()
+                        except Exception as e:
+                            self._log.warning('Local package import failed dynamically: %s. Falling back to AutoModel.', e)
+                            self.model = AutoModel.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True).to(self.device).eval()
+                        finally:
+                            if sys.path[0] == parent_dir:
+                                sys.path.pop(0)
+                    else:
+                        self.processor = AutoImageProcessor.from_pretrained(model_dir, local_files_only=True)
+                        self.model = AutoModel.from_pretrained(model_dir, local_files_only=True).to(self.device).eval()
 
                     # Caches keyed by frame_idx
                     self.cache = {}        # frame_idx -> torch.Tensor embedding (normalized)
@@ -1291,11 +1329,17 @@ class SceneDetectApp:
                     self.flash_luma_delta = float(flash_luma_delta)
 
                     # Extract normalization constants from the HF processor for GPU tensor pipeline.
-                    _img_mean = getattr(self.processor, 'image_mean', None) or [0.485, 0.456, 0.406]
-                    _img_std = getattr(self.processor, 'image_std', None) or [0.229, 0.224, 0.225]
-                    self._dino_mean = torch.tensor(_img_mean, device=self.device).view(1, 3, 1, 1)
-                    self._dino_std = torch.tensor(_img_std, device=self.device).view(1, 3, 1, 1)
-                    self._dino_rescale = float(getattr(self.processor, 'rescale_factor', 1.0 / 255.0))
+                    if self.val_model == "TIPSv2":
+                        self._dino_mean = torch.tensor([0.0, 0.0, 0.0], device=self.device).view(1, 3, 1, 1)
+                        self._dino_std = torch.tensor([1.0, 1.0, 1.0], device=self.device).view(1, 3, 1, 1)
+                        self._dino_rescale = 1.0 / 255.0
+                        self._tgt_size = (448, 448)
+                    else:
+                        _img_mean = getattr(self.processor, 'image_mean', None) or [0.485, 0.456, 0.406]
+                        _img_std = getattr(self.processor, 'image_std', None) or [0.229, 0.224, 0.225]
+                        self._dino_mean = torch.tensor(_img_mean, device=self.device).view(1, 3, 1, 1)
+                        self._dino_std = torch.tensor(_img_std, device=self.device).view(1, 3, 1, 1)
+                        self._dino_rescale = float(getattr(self.processor, 'rescale_factor', 1.0 / 255.0))
                     # ---- Optional SSCD (photometric-invariant descriptor) ----
                     self.sscd_model = None
                     self.sscd_input = int(sscd_input)
@@ -1319,6 +1363,8 @@ class SceneDetectApp:
 
 
                 def _target_size(self):
+                    if getattr(self, 'val_model', 'DINOv3') == 'TIPSv2':
+                        return getattr(self, '_tgt_size', (448, 448))
                     size = getattr(self.processor, 'size', None) or {}
                     if isinstance(size, dict):
                         h = int(size.get('height') or size.get('shortest_edge') or 224)
@@ -1381,10 +1427,14 @@ class SceneDetectApp:
                     import torch
                     with torch.inference_mode():
                         outputs = self.model(pixel_values=pixel_values)
-                        pooled = getattr(outputs, 'pooler_output', None)
-                        if pooled is None:
-                            # Fallback to CLS token if pooler_output is unavailable.
-                            pooled = outputs.last_hidden_state[:, 0]
+                        if getattr(self, 'val_model', 'DINOv3') == 'TIPSv2':
+                            # TIPSv2 dataclass returns: TIPSv2Output -> TIPSv2ImageOutput -> cls_token (B, 1, D)
+                            pooled = outputs.image_features.cls_token.squeeze(1)
+                        else:
+                            pooled = getattr(outputs, 'pooler_output', None)
+                            if pooled is None:
+                                # Fallback to CLS token if pooler_output is unavailable.
+                                pooled = outputs.last_hidden_state[:, 0]
                         return torch.nn.functional.normalize(pooled, dim=-1)
 
                 # ---- SSCD helpers (optional) ----
@@ -1694,22 +1744,26 @@ class SceneDetectApp:
 
                 # --- Similarity helpers ---
 
-                @staticmethod
-                def _pairwise_median_similarity(pre_vecs, post_vecs) -> float:
+                def _pairwise_median_similarity(self, pre_vecs, post_vecs) -> float:
                     import torch
                     pre = torch.stack(pre_vecs, dim=0)
                     post = torch.stack(post_vecs, dim=0)
                     sim = pre @ post.T
-                    return float(sim.flatten().median().item())
+                    val = float(sim.flatten().median().item())
+                    if getattr(self, 'val_model', 'DINOv3') == 'TIPSv2':
+                        val = 1.0 - (1.0 - val) * 4.0
+                    return val
 
-                @staticmethod
-                def _avg_adjacent_similarity(vecs) -> float:
+                def _avg_adjacent_similarity(self, vecs) -> float:
                     import torch
                     if len(vecs) < 2:
                         return 1.0
                     mat = torch.stack(vecs, dim=0)
                     sims = (mat[:-1] * mat[1:]).sum(dim=1)
-                    return float(sims.mean().item())
+                    val = float(sims.mean().item())
+                    if getattr(self, 'val_model', 'DINOv3') == 'TIPSv2':
+                        val = 1.0 - (1.0 - val) * 4.0
+                    return val
 
                 @staticmethod
                 def _otsu_threshold(scores, bins: int = 128) -> float:
@@ -2048,6 +2102,8 @@ class SceneDetectApp:
                     s_adj = None
                     if pre_adj in self.cache and post_adj in self.cache:
                         s_adj = float((self.cache[pre_adj] * self.cache[post_adj]).sum().item())
+                        if getattr(self, 'val_model', 'DINOv3') == 'TIPSv2':
+                            s_adj = 1.0 - (1.0 - s_adj) * 4.0
 
                     pre_cont = self._avg_adjacent_similarity(pre_vecs_s)
                     post_cont = self._avg_adjacent_similarity(post_vecs_s)
@@ -2543,8 +2599,12 @@ class SceneDetectApp:
                     return validated_scenes
 
 
+            v_model = self.ai_val_model_var.get()
+            v_dir = f"./weights/{v_model}"
+            
             validator = DinoCutValidator(
-                model_dir="./weights",
+                model_dir=v_dir,
+                val_model=v_model,
                 batch_size=48,
                 flash_luma_delta=float(self.flash_sensitivity_var.get())
             )

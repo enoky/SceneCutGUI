@@ -6,6 +6,7 @@ torchaudio==2.9.1
 einops
 transnetv2-pytorch
 transformers
+sentencepiece
 numpy
 
 # pip install opencv-contrib-python with CUDA from here: https://github.com/cudawarped/opencv-python-cuda-wheels/releases
