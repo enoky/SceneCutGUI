@@ -4,6 +4,7 @@ import os
 import sys
 import logging
 import subprocess
+import functools
 import json
 import csv
 from pathlib import Path
@@ -154,6 +155,168 @@ def _parse_fraction(frac: str) -> float:
         return float(frac)
     except Exception:
         return 0.0
+
+
+def _parse_fraction_exact(frac: str) -> tuple[int, int]:
+    """Parse an ffprobe rational ('30000/1001') into an exact (num, den) pair.
+
+    Returns (0, 0) when the value cannot be interpreted, so callers can fall
+    back to a float frame rate.
+    """
+    try:
+        if not frac:
+            return (0, 0)
+        if "/" in frac:
+            num, den = frac.split("/", 1)
+            num_i, den_i = int(num), int(den)
+            return (num_i, den_i) if num_i > 0 and den_i > 0 else (0, 0)
+        num_i = int(round(float(frac) * 1000))
+        return (num_i, 1000) if num_i > 0 else (0, 0)
+    except Exception:
+        return (0, 0)
+
+
+# How far before a scene start to place the fast input seek. Correctness does
+# not depend on this (input seeking always lands on a keyframe at or before the
+# target); it only absorbs imprecise container indexes.
+SEEK_MARGIN_SEC = 0.5
+
+
+@functools.lru_cache(maxsize=1)
+def has_nvenc_hevc() -> bool:
+    """True when this FFmpeg build exposes the NVIDIA hevc_nvenc encoder."""
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, creationflags=creationflags, check=False,
+        )
+        return "hevc_nvenc" in (result.stdout or "")
+    except FileNotFoundError:
+        return False
+
+
+def verify_cfr(video_path: str, fps_num: int, fps_den: int) -> bool:
+    """Check that every video packet actually sits on the constant-frame-rate grid.
+
+    Comparing r_frame_rate to avg_frame_rate is not enough: containers routinely
+    report both as a clean value (e.g. 30/1) for material whose real timestamps
+    are irregular, and acting on that false positive makes timestamp-based
+    trimming select the wrong frames. Reading packet timestamps settles it - this
+    inspects the container index only and never decodes.
+    """
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0", video_path],
+            capture_output=True, text=True, creationflags=creationflags, check=False,
+        )
+        if result.returncode != 0:
+            return False
+        stamps = []
+        for line in (result.stdout or "").split():
+            try:
+                stamps.append(float(line))
+            except ValueError:
+                # "N/A" means the container has no usable timestamp for a packet,
+                # which by itself rules out timestamp-based trimming.
+                return False
+        stamps.sort()
+    except FileNotFoundError:
+        return False
+
+    if len(stamps) < 2:
+        return False
+    # Packets arrive in decode order, so sort into presentation order first, then
+    # require every frame within half a frame of its ideal slot.
+    frame_dur = fps_den / fps_num
+    tolerance = 0.5 * frame_dur
+    origin = stamps[0]
+    for i, pts in enumerate(stamps):
+        if abs(pts - (origin + i * frame_dur)) > tolerance:
+            return False
+    return True
+
+
+def can_hwdecode(video_path: str) -> bool:
+    """Test whether this source can run the full NVDEC -> CUDA -> NVENC pipeline.
+
+    NVDEC does not cover every codec and chroma layout (4:2:2, ProRes, DNxHD and
+    AV1 on older GPUs are common gaps), so rather than guess from the codec name
+    we run the real filter chain over a single frame and see if it survives.
+    """
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error", "-hide_banner",
+             "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+             "-i", video_path, "-frames:v", "1",
+             "-filter_complex", "[0:v]scale_cuda=format=p010le[v]", "-map", "[v]",
+             "-c:v", "hevc_nvenc", "-f", "null", "-"],
+            capture_output=True, text=True, creationflags=creationflags, check=False,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def probe_stream_props(video_path: str) -> dict:
+    """Probe the properties needed for a frame-exact, colour-faithful re-encode."""
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    props: dict = {"has_audio": False, "fps_num": 0, "fps_den": 0,
+                   "start_time": 0.0, "is_cfr": False}
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,r_frame_rate,avg_frame_rate,start_time,"
+             "color_range,color_space,color_transfer,color_primaries",
+             "-of", "json", video_path],
+            capture_output=True, text=True, creationflags=creationflags, check=False,
+        )
+        if result.returncode != 0:
+            return props
+        for stream in json.loads(result.stdout or "{}").get("streams", []):
+            if stream.get("codec_type") == "audio":
+                props["has_audio"] = True
+            elif stream.get("codec_type") == "video" and not props["fps_num"]:
+                r_num, r_den = _parse_fraction_exact(stream.get("r_frame_rate", ""))
+                props["fps_num"], props["fps_den"] = r_num, r_den
+                try:
+                    props["start_time"] = max(0.0, float(stream.get("start_time") or 0.0))
+                except (TypeError, ValueError):
+                    props["start_time"] = 0.0
+                # Frame index <-> timestamp arithmetic is only valid on constant
+                # frame rate material. The declared rates agreeing is a cheap
+                # prerequisite but NOT proof - containers report a clean
+                # r_frame_rate/avg_frame_rate pair for genuinely irregular
+                # material - so confirm against real packet timestamps.
+                a_num, a_den = _parse_fraction_exact(stream.get("avg_frame_rate", ""))
+                rates_agree = bool(
+                    r_num and a_num and abs(r_num / r_den - a_num / a_den) < 1e-6
+                )
+                props["is_cfr"] = rates_agree and verify_cfr(video_path, r_num, r_den)
+                for key in ("color_range", "color_space", "color_transfer", "color_primaries"):
+                    value = stream.get(key)
+                    if value and value != "unknown":
+                        props[key] = value
+    except (FileNotFoundError, ValueError):
+        pass
+    return props
+
+
+def probe_frame_count(video_path: str) -> int:
+    """Container-reported frame count of a video (0 when unavailable)."""
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+             "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", video_path],
+            capture_output=True, text=True, creationflags=creationflags, check=False,
+        )
+        return int((result.stdout or "0").strip() or 0)
+    except (FileNotFoundError, ValueError):
+        return 0
 
 
 def get_video_info(video_path: str) -> tuple[float, int]:
@@ -781,7 +944,6 @@ class SceneDetectApp:
         self._last_detector_type = self.detector_type_var.get()
         self.snap_cuts_var = tk.BooleanVar(value=True)
         self.ai_validate_var = tk.BooleanVar(value=False)
-        self.ai_val_model_var = tk.StringVar(value="DINOv3")
         self.ai_window_var = tk.IntVar(value=5)
         self.flash_sensitivity_var = tk.IntVar(value=15)  # Luma delta threshold for flash detection
 
@@ -796,7 +958,8 @@ class SceneDetectApp:
         self.sc_offset_var = tk.IntVar(value=0)
 
         # --- FFmpeg Variables ---
-        self.ffmpeg_codec_var = tk.StringVar(value="h264_nvenc")
+        # Output codec is fixed: 10-bit HEVC on the NVIDIA GPU (CPU libx265 fallback).
+        self.ffmpeg_codec_var = tk.StringVar(value="hevc_nvenc")
         self.ffmpeg_preset_var = tk.StringVar(value="p7")
         self.ffmpeg_cq_var = tk.IntVar(value=16)
 
@@ -871,9 +1034,9 @@ class SceneDetectApp:
         ffmpeg_frame.grid(row=1, column=1, sticky="ns", padx=(10, 5), pady=2)
 
         ttk.Label(ffmpeg_frame, text="Codec:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        codec_combo = ttk.Combobox(ffmpeg_frame, textvariable=self.ffmpeg_codec_var, values=["h264_nvenc", "hevc_nvenc", "libx264"], state="readonly", width=12)
-        codec_combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
-        self._attach_tooltip(codec_combo, "ffmpeg_codec")
+        codec_label = ttk.Label(ffmpeg_frame, text="HEVC 10-bit (NVENC)")
+        codec_label.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self._attach_tooltip(codec_label, "ffmpeg_codec")
         
         ttk.Label(ffmpeg_frame, text="Preset:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
         presets = [f"p{i}" for i in range(1, 8)]
@@ -896,18 +1059,15 @@ class SceneDetectApp:
         snap_check.grid(row=0, column=0, columnspan=4, padx=5, pady=5, sticky="w")
         self._attach_tooltip(snap_check, "snap_cuts")
 
-        ai_check = ttk.Checkbutton(ai_frame, text="Validate cuts with AI:", variable=self.ai_validate_var)
+        ai_check = ttk.Checkbutton(ai_frame, text="Validate cuts with DINOv3 AI:", variable=self.ai_validate_var)
         ai_check.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="w")
         self._attach_tooltip(ai_check, "ai_validate")
-        
-        ai_combo = ttk.Combobox(ai_frame, textvariable=self.ai_val_model_var, values=["DINOv3", "TIPSv2"], state="readonly", width=10)
-        ai_combo.grid(row=1, column=2, padx=5, pady=5, sticky="w")
-        self._attach_tooltip(ai_combo, "ai_val_model")
+
         ttk.Label(ai_frame, text="Validation Window (frames):").grid(row=2, column=0, padx=5, pady=5, sticky="w")
         ai_spin = ttk.Spinbox(ai_frame, from_=2, to=10, textvariable=self.ai_window_var, width=5)
         ai_spin.grid(row=2, column=1, padx=5, pady=5, sticky="w")
         self._attach_tooltip(ai_spin, "ai_window")
-        
+
         ttk.Label(ai_frame, text="Flash Sensitivity:").grid(row=2, column=2, padx=(20, 5), pady=5, sticky="w")
         flash_spin = ttk.Spinbox(ai_frame, from_=10, to=80, textvariable=self.flash_sensitivity_var, width=5)
         flash_spin.grid(row=2, column=3, padx=5, pady=5, sticky="w")
@@ -1028,7 +1188,6 @@ class SceneDetectApp:
             "detector_params": self.detector_params_cache,
             "snap_cuts": self.snap_cuts_var.get(),
             "ai_validate": self.ai_validate_var.get(),
-            "ai_val_model": self.ai_val_model_var.get(),
             "ai_window": self.ai_window_var.get(),
             "flash_sensitivity": self.flash_sensitivity_var.get(),
             "export_csv": self.export_csv_var.get(),
@@ -1063,7 +1222,6 @@ class SceneDetectApp:
             
             self.snap_cuts_var.set(settings.get("snap_cuts", True))
             self.ai_validate_var.set(settings.get("ai_validate", False))
-            self.ai_val_model_var.set(settings.get("ai_val_model", "DINOv3"))
             self.ai_window_var.set(settings.get("ai_window", 3))
             self.flash_sensitivity_var.set(settings.get("flash_sensitivity", 15))
             self.export_csv_var.set(settings.get("export_csv", False))
@@ -1074,7 +1232,8 @@ class SceneDetectApp:
             self.num_images_var.set(settings.get("num_images", 3))
             self.frame_margin_var.set(settings.get("frame_margin", 1))
             self.sc_offset_var.set(settings.get("sc_offset", 0))
-            self.ffmpeg_codec_var.set(settings.get("ffmpeg_codec", "h264_nvenc"))
+            # Codec is no longer user-selectable; ignore any legacy saved value.
+            self.ffmpeg_codec_var.set("hevc_nvenc")
             self.ffmpeg_preset_var.set(settings.get("ffmpeg_preset", "p7"))
             self.ffmpeg_cq_var.set(settings.get("ffmpeg_cq", 16))
             
@@ -1551,1390 +1710,26 @@ class SceneDetectApp:
         return snapped_scenes
 
     def _run_ai_validation(self, video_path, scenes, short_guard_frames: int):
+        """Filter detector output through the AI cut validator.
+
+        The validator itself lives in cut_validator.py; it is imported lazily so
+        that a missing torch/transformers/OpenCV only disables validation rather
+        than preventing the GUI from starting.
+        """
         try:
-            import cv2
-            import torch
-            import numpy as np
-            from transformers import AutoImageProcessor, AutoModel
-
-            class DinoCutValidator:
-                # --- General ---
-                DEFAULT_BASE_THRESHOLD = 0.88
-                MAX_LARGE_WINDOW = 24
-
-                # SSCD stable-frame settings (used only when SSCD is available)
-                SSCD_K = 5             # median of up to 5 frames per side
-                SSCD_MIN_K = 3         # need at least 3 frames per side (else fallback)
-
-                # Adjacent-frame discontinuity = strong cut evidence (unless flash is strong)
-                ADJ_STRONG_CUT = 0.68
-
-                # --- Flash detection window (frames relative to cut_frame) ---
-                FLASH_SCAN = 12         # analyze +/- this many frames around cut
-                FLASH_CENTER = 4        # spike must occur within +/- this region
-                FLASH_BASE_GAP = 5      # baseline windows start beyond this offset from the cut
-
-                FLASH_MIN_DUR = 1
-                FLASH_MAX_DUR = 8
-
-                # --- Pixel cue (HSV H,S histogram intersection in [0,1]) ---
-                PIXEL_HIST_MIN = 0.08
-                PIXEL_HIST_STRONG = 0.14
-
-                # --- Similarity guardrails ---
-                MIN_STABLE_SIM = 0.72   # absolute floor for merging on flash evidence
-
-                # ANSI color helpers for console output (optional)
-                KEEP_FG = "\033[94m"
-                MERG_FG = "\033[92m"
-                BOLD = "\033[1m"
-                RESET = "\033[0m"
-
-                def __init__(self, model_dir: str = './weights/DINOv3', val_model: str = 'DINOv3', device=None, batch_size: int = 48,
-                             flash_luma_delta: float = 30.0,
-                             enable_sscd: bool = True, sscd_model_path: str = None, sscd_input: int = 288,
-                             logger=None):
-                    import os
-                    import logging
-                    import torch
-                    from transformers import AutoImageProcessor, AutoModel
-
-                    self._log = logger or logging.getLogger('DinoCutValidator')
-                    self.val_model = val_model
-
-                    if not os.path.isdir(model_dir):
-                        raise FileNotFoundError(f'{self.val_model} model directory not found: {model_dir}')
-
-                    self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-                    if self.device == 'cpu':
-                        raise RuntimeError('AI Validation requires a CUDA-enabled GPU and PyTorch.')
-
-                    self._log.debug('Loading %s model on device: %s', self.val_model, self.device)
-                    if self.val_model == "TIPSv2":
-                        self.processor = None
-                        import sys
-                        import importlib
-                        # Package loading to bypass relative import errors and HF hub downloading issues
-                        model_dir_abs = os.path.abspath(model_dir)
-                        parent_dir = os.path.dirname(model_dir_abs)
-                        pkg_name = os.path.basename(model_dir_abs)
-                        
-                        init_file = os.path.join(model_dir_abs, "__init__.py")
-                        if not os.path.exists(init_file):
-                            try:
-                                with open(init_file, 'w') as f: pass
-                            except OSError:
-                                pass
-                                
-                        sys.path.insert(0, parent_dir)
-                        try:
-                            # Dynamic module import as a package enables relative imports within modeling_tips to work
-                            mod_cfg = importlib.import_module(f"{pkg_name}.configuration_tips")
-                            mod_mdl = importlib.import_module(f"{pkg_name}.modeling_tips")
-                            config = mod_cfg.TIPSv2Config.from_pretrained(model_dir)
-                            self.model = mod_mdl.TIPSv2Model.from_pretrained(model_dir, config=config).to(self.device).eval()
-                        except Exception as e:
-                            self._log.warning('Local package import failed dynamically: %s. Falling back to AutoModel.', e)
-                            self.model = AutoModel.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True).to(self.device).eval()
-                        finally:
-                            if sys.path[0] == parent_dir:
-                                sys.path.pop(0)
-                    else:
-                        self.processor = AutoImageProcessor.from_pretrained(model_dir, local_files_only=True)
-                        self.model = AutoModel.from_pretrained(model_dir, local_files_only=True).to(self.device).eval()
-
-                    # Caches keyed by frame_idx
-                    self.cache = {}        # frame_idx -> torch.Tensor embedding (normalized)
-                    self.luma_cache = {}   # frame_idx -> float mean luma (0-255)
-                    self.vhi_cache = {}    # frame_idx -> float HSV-V p99.5 (0-255), catches sparse lightning
-                    self.hist_cache = {}   # frame_idx -> np.ndarray HSV (H,S) hist (L1 normalized)
-
-                    self.batch_size = int(batch_size)
-                    self.total_video_frames = 0
-
-                    # User sensitivity knob: smaller -> more sensitive (merge more flash cuts)
-                    self.flash_luma_delta = float(flash_luma_delta)
-
-                    # Extract normalization constants from the HF processor for GPU tensor pipeline.
-                    if self.val_model == "TIPSv2":
-                        self._dino_mean = torch.tensor([0.0, 0.0, 0.0], device=self.device).view(1, 3, 1, 1)
-                        self._dino_std = torch.tensor([1.0, 1.0, 1.0], device=self.device).view(1, 3, 1, 1)
-                        self._dino_rescale = 1.0 / 255.0
-                        self._tgt_size = (448, 448)
-                    else:
-                        _img_mean = getattr(self.processor, 'image_mean', None) or [0.485, 0.456, 0.406]
-                        _img_std = getattr(self.processor, 'image_std', None) or [0.229, 0.224, 0.225]
-                        self._dino_mean = torch.tensor(_img_mean, device=self.device).view(1, 3, 1, 1)
-                        self._dino_std = torch.tensor(_img_std, device=self.device).view(1, 3, 1, 1)
-                        self._dino_rescale = float(getattr(self.processor, 'rescale_factor', 1.0 / 255.0))
-                    # ---- Optional SSCD (photometric-invariant descriptor) ----
-                    self.sscd_model = None
-                    self.sscd_input = int(sscd_input)
-                    self._sscd_video_path = None
-                    self._sscd_cap = None
-                    from collections import OrderedDict
-                    self._sscd_frame_cache = OrderedDict()  # frame_idx -> resized RGB uint8
-                    self._sscd_frame_cache_max = 128
-                    # SSCD hub models typically use ImageNet normalization
-                    self._sscd_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-                    self._sscd_std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
-                    if bool(enable_sscd):
-                        try:
-                            if sscd_model_path is None:
-                                sscd_model_path = os.path.join(model_dir, 'sscd_disc_large.torchscript.pt')
-                            self._init_sscd(sscd_model_path)
-                            self._log.info('SSCD enabled (torchscript: %s).', sscd_model_path)
-                        except Exception as e:
-                            self.sscd_model = None
-                            self._log.warning('SSCD unavailable (continuing with DINO-only): %s', e)
-
-
-                def _target_size(self):
-                    if getattr(self, 'val_model', 'DINOv3') == 'TIPSv2':
-                        return getattr(self, '_tgt_size', (448, 448))
-                    size = getattr(self.processor, 'size', None) or {}
-                    if isinstance(size, dict):
-                        h = int(size.get('height') or size.get('shortest_edge') or 224)
-                        w = int(size.get('width') or size.get('shortest_edge') or 224)
-                    else:
-                        h = w = 224
-                    return (w, h)  # OpenCV uses (width, height)
-
-                @staticmethod
-                def _luma_from_rgb(rgb_uint8) -> float:
-                    import numpy as np
-                    r = rgb_uint8[:, :, 0].astype(np.float32)
-                    g = rgb_uint8[:, :, 1].astype(np.float32)
-                    b = rgb_uint8[:, :, 2].astype(np.float32)
-                    return float((0.2126 * r + 0.7152 * g + 0.0722 * b).mean())
-
-                @staticmethod
-                def _hsv_hist_and_vhi_from_rgb(rgb_uint8):
-                    """Return (hist_flat, v_hi_p995)."""
-                    import numpy as np
-                    import cv2
-
-                    hsv = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2HSV)
-
-                    # Pixel cue: coarse H,S histogram
-                    hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
-                    hist = hist.astype(np.float32)
-                    s = float(hist.sum())
-                    if s > 1e-6:
-                        hist /= s
-                    hist_flat = hist.reshape(-1)
-
-                    v = hsv[:, :, 2].astype(np.float32)
-                    v_hi = float(np.percentile(v, 99.5))
-                    return hist_flat, v_hi
-
-                @staticmethod
-                def _hist_intersection(h1, h2) -> float:
-                    import numpy as np
-                    if h1 is None or h2 is None:
-                        return float('nan')
-                    return float(np.minimum(h1, h2).sum())
-
-                def _flash_signal(self, frame_idx: int):
-                    """Single scalar flash signal per frame, designed to catch sparse lightning.
-
-                    We use max(mean_luma, V_p99.5). V_p99.5 catches lightning bolts that occupy few pixels.
-                    """
-                    l = self.luma_cache.get(frame_idx)
-                    v = self.vhi_cache.get(frame_idx)
-                    if l is None and v is None:
-                        return None
-                    if l is None:
-                        return float(v)
-                    if v is None:
-                        return float(l)
-                    return float(max(float(l), float(v)))
-
-                def _embed_batch(self, pixel_values):
-                    import torch
-                    with torch.inference_mode():
-                        outputs = self.model(pixel_values=pixel_values)
-                        if getattr(self, 'val_model', 'DINOv3') == 'TIPSv2':
-                            # TIPSv2 dataclass returns: TIPSv2Output -> TIPSv2ImageOutput -> cls_token (B, 1, D)
-                            pooled = outputs.image_features.cls_token.squeeze(1)
-                        else:
-                            pooled = getattr(outputs, 'pooler_output', None)
-                            if pooled is None:
-                                # Fallback to CLS token if pooler_output is unavailable.
-                                pooled = outputs.last_hidden_state[:, 0]
-                        return torch.nn.functional.normalize(pooled, dim=-1)
-
-                # ---- SSCD helpers (optional) ----
-                def _init_sscd(self, model_path: str):
-                    """Load SSCD TorchScript model from disk.
-
-                    SSCD is a photometric-robust descriptor for copy / near-duplicate detection.
-                    Here it is used only as a *flash-robust same-shot* signal by comparing
-                    median-composited stable frames (3-5 frames per side) across the boundary.
-
-                    The common SSCD preprocessing is:
-                      - resize to 288x288
-                      - ToTensor() in [0,1]
-                      - ImageNet normalize (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
-                    """
-                    import os
-                    import torch
-
-                    p = str(model_path or '')
-                    if not p:
-                        raise ValueError('SSCD model_path is empty.')
-                    # Resolve relative paths against the current working directory.
-                    if not os.path.isabs(p):
-                        p = os.path.normpath(p)
-                    if not os.path.exists(p):
-                        # Best-effort fallback: try alongside the DINO weights directory.
-                        alt = os.path.join('./weights', os.path.basename(p))
-                        if os.path.exists(alt):
-                            p = alt
-                        else:
-                            raise FileNotFoundError(f'SSCD TorchScript file not found: {model_path}')
-
-                    self._log.info('Loading SSCD TorchScript model: %s', p)
-                    m = torch.jit.load(p, map_location=self.device)
-                    try:
-                        m = m.to(self.device)
-                    except Exception:
-                        pass
-                    m.eval()
-                    self.sscd_model = m
-
-                def _sscd_required_sim(self, motion: float) -> float:
-                    """Dynamic SSCD threshold driven by the GUI Flash Sensitivity knob.
-
-                    Lower Flash Sensitivity => more aggressive flash merging => lower required SSCD sim.
-                    """
-                    sens = float(max(15.0, min(80.0, getattr(self, 'flash_luma_delta', 30.0))))
-                    # sens=15 -> ~0.68 ; sens=80 -> ~0.78
-                    base = 0.78 - 0.0015 * (80.0 - sens)
-                    base = base - 0.05 * float(max(0.0, min(1.0, motion)))
-                    return float(max(0.62, min(0.84, base)))
-
-                def _sscd_get_cap(self, video_path: str):
-                    import cv2
-                    if (self._sscd_cap is None) or (self._sscd_video_path != video_path):
-                        try:
-                            if self._sscd_cap is not None:
-                                self._sscd_cap.release()
-                        except Exception:
-                            pass
-                        self._sscd_video_path = video_path
-                        self._sscd_cap = cv2.VideoCapture(video_path)
-                        if not self._sscd_cap.isOpened():
-                            raise RuntimeError(f'Could not open video for SSCD decode: {video_path}')
-                    return self._sscd_cap
-
-                def _sscd_read_frame_rgb(self, video_path: str, frame_idx: int):
-                    """Read + resize an RGB frame for SSCD; cached with a small LRU."""
-                    import cv2
-                    import numpy as np
-
-                    # LRU cache hit
-                    if frame_idx in self._sscd_frame_cache:
-                        rgb = self._sscd_frame_cache.pop(frame_idx)
-                        self._sscd_frame_cache[frame_idx] = rgb
-                        return rgb
-
-                    cap = self._sscd_get_cap(video_path)
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-                    ok, frame = cap.read()
-                    if not ok or frame is None:
-                        return None
-                    frame = cv2.resize(frame, (self.sscd_input, self.sscd_input), interpolation=cv2.INTER_AREA)
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                    # Insert into LRU
-                    self._sscd_frame_cache[frame_idx] = rgb
-                    if len(self._sscd_frame_cache) > int(self._sscd_frame_cache_max):
-                        self._sscd_frame_cache.popitem(last=False)
-                    return rgb
-
-                def _sscd_embed_rgb(self, rgb_uint8):
-                    import torch
-                    import torch.nn.functional as F
-                    if rgb_uint8 is None:
-                        return None
-                    x = torch.from_numpy(rgb_uint8).to(self.device).float() / 255.0
-                    x = x.permute(2, 0, 1).unsqueeze(0).contiguous()
-                    x = (x - self._sscd_mean) / self._sscd_std
-                    with torch.inference_mode():
-                        out = self.sscd_model(x)
-                    # TorchScript usually returns a Tensor; keep some generic handling anyway.
-                    if isinstance(out, (tuple, list)):
-                        out = out[0]
-                    if isinstance(out, dict):
-                        out = out.get('embeddings') or out.get('embedding') or next(iter(out.values()))
-                    if not torch.is_tensor(out):
-                        return None
-                    if out.dim() == 2:
-                        out = out[0]
-                    v = out.flatten()
-                    return F.normalize(v, dim=0)
-
-                @staticmethod
-                def _median_composite(frames_rgb_list):
-                    import numpy as np
-                    if not frames_rgb_list:
-                        return None
-                    stack = np.stack(frames_rgb_list, axis=0).astype(np.float32)
-                    comp = np.median(stack, axis=0)
-                    comp = np.clip(comp, 0, 255).astype(np.uint8)
-                    return comp
-
-                def _select_stable_indices_near_cut(self, cut_frame: int, total_frames: int, side: str, flash_event: dict):
-                    """Pick 3-5 stable frames close to the boundary for SSCD median compositing."""
-                    spike = set(int(x) for x in (flash_event.get('spike_frames') or []))
-                    baseline = flash_event.get('baseline')
-                    amp = float(flash_event.get('amp', 0.0) or 0.0)
-
-                    # Candidate order: closest to boundary first
-                    if side == 'pre':
-                        cands = [cut_frame - k for k in range(1, 1 + 12)]
-                    else:
-                        cands = [cut_frame + k for k in range(0, 12)]
-                    cands = [int(max(0, min(total_frames - 1, i))) for i in cands]
-
-                    # If we don't know baseline yet, just take the closest frames excluding spikes
-                    if baseline is None:
-                        chosen = []
-                        for i in cands:
-                            if i in spike:
-                                continue
-                            chosen.append(i)
-                            if len(chosen) >= self.SSCD_K:
-                                break
-                        return chosen
-
-                    # Tolerance: accept frames close to baseline, excluding spike frames
-                    tol = float(max(12.0, 0.35 * abs(amp)))
-                    chosen = []
-                    for i in cands:
-                        if i in spike:
-                            continue
-                        v = self._flash_signal(i)
-                        if v is None:
-                            continue
-                        if abs(float(v) - float(baseline)) <= tol:
-                            chosen.append(i)
-                            if len(chosen) >= self.SSCD_K:
-                                break
-
-                    # If too few, relax tolerance once
-                    if len(chosen) < self.SSCD_MIN_K:
-                        tol2 = tol * 1.6
-                        chosen = []
-                        for i in cands:
-                            if i in spike:
-                                continue
-                            v = self._flash_signal(i)
-                            if v is None:
-                                continue
-                            if abs(float(v) - float(baseline)) <= tol2:
-                                chosen.append(i)
-                                if len(chosen) >= self.SSCD_K:
-                                    break
-
-                    return chosen
-
-                def _sscd_stable_similarity(self, video_path: str, cut_frame: int, total_frames: int, flash_event: dict):
-                    """Compute SSCD cosine similarity between median-composited stable frames."""
-                    import math
-                    if (self.sscd_model is None) or (not video_path):
-                        return None
-
-                    pre_ids = self._select_stable_indices_near_cut(cut_frame, total_frames, 'pre', flash_event)
-                    post_ids = self._select_stable_indices_near_cut(cut_frame, total_frames, 'post', flash_event)
-                    if len(pre_ids) < self.SSCD_MIN_K or len(post_ids) < self.SSCD_MIN_K:
-                        return None
-
-                    pre_frames = [self._sscd_read_frame_rgb(video_path, i) for i in pre_ids]
-                    post_frames = [self._sscd_read_frame_rgb(video_path, i) for i in post_ids]
-                    pre_frames = [f for f in pre_frames if f is not None]
-                    post_frames = [f for f in post_frames if f is not None]
-                    if len(pre_frames) < self.SSCD_MIN_K or len(post_frames) < self.SSCD_MIN_K:
-                        return None
-
-                    pre_comp = self._median_composite(pre_frames)
-                    post_comp = self._median_composite(post_frames)
-                    e1 = self._sscd_embed_rgb(pre_comp)
-                    e2 = self._sscd_embed_rgb(post_comp)
-                    if e1 is None or e2 is None:
-                        return None
-                    sim = float((e1 * e2).sum().item())
-                    if math.isnan(sim):
-                        return None
-                    return sim
-
-
-                def _embed_all_required_frames(self, video_path: str, indices_to_embed, abort_flag=None, progress_cb=None):
-                    import cv2
-                    import torch
-                    import numpy as np
-
-                    indices = sorted(set(int(i) for i in indices_to_embed))
-                    if not indices:
-                        return
-
-                    self._log.info('Embedding %d unique frames via seek-based decode...', len(indices))
-
-                    target_size = self._target_size()
-                    batch_imgs, batch_ids = [], []
-
-                    cap = cv2.VideoCapture(video_path)
-                    if not cap.isOpened():
-                        raise RuntimeError(f'Could not open video for embedding: {video_path}')
-
-                    # --- Group frame indices into consecutive runs ---
-                    # E.g. [10,11,12, 500,501, 8000] -> [(10,[10,11,12]), (500,[500,501]), (8000,[8000])]
-                    runs = []
-                    run_start = indices[0]
-                    current_run = [indices[0]]
-                    for i in range(1, len(indices)):
-                        if indices[i] == current_run[-1] + 1:
-                            current_run.append(indices[i])
-                        else:
-                            runs.append((run_start, current_run))
-                            run_start = indices[i]
-                            current_run = [indices[i]]
-                    runs.append((run_start, current_run))
-
-                    total_frames_to_decode = len(indices)
-                    total_frames_skipped = (indices[-1] - indices[0] + 1) - total_frames_to_decode if len(indices) > 1 else 0
-                    self._log.info(
-                        'Seek-based decode: %d runs covering %d frames (skipping ~%d intermediate frames)',
-                        len(runs), total_frames_to_decode, total_frames_skipped,
-                    )
-
-                    def flush_batch():
-                        nonlocal batch_imgs, batch_ids
-                        if not batch_imgs:
-                            return
-                        # GPU tensor pipeline: bypass HuggingFace processor for speed.
-                        stacked = np.stack(batch_imgs, axis=0)  # (B, H, W, 3) uint8
-                        t = torch.from_numpy(stacked).to(self.device, non_blocking=True)
-                        # (B, H, W, C) -> (B, C, H, W), scale to [0,1]
-                        t = t.permute(0, 3, 1, 2).float() * self._dino_rescale
-                        # ImageNet normalize
-                        t = (t - self._dino_mean) / self._dino_std
-                        embeddings = self._embed_batch(t)
-                        for j, fid in enumerate(batch_ids):
-                            self.cache[fid] = embeddings[j]
-                        batch_imgs, batch_ids = [], []
-
-                    wanted_i = 0
-                    total_wanted = len(indices)
-
-                    for run_start_frame, run_frames in runs:
-                        if abort_flag is not None and abort_flag.is_set():
-                            raise InterruptedError
-
-                        # Seek to the start of this run
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, run_start_frame)
-
-                        for expected_frame in run_frames:
-                            if abort_flag is not None and abort_flag.is_set():
-                                raise InterruptedError
-
-                            ret, frame = cap.read()
-                            if not ret or frame is None:
-                                self._log.debug('Failed to read frame %d, skipping.', expected_frame)
-                                continue
-
-                            frame = cv2.resize(frame, target_size)
-                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                            luma = self._luma_from_rgb(rgb)
-                            hist, v_hi = self._hsv_hist_and_vhi_from_rgb(rgb)
-
-                            self.luma_cache[expected_frame] = luma
-                            self.vhi_cache[expected_frame] = v_hi
-                            self.hist_cache[expected_frame] = hist
-
-                            batch_imgs.append(rgb)
-                            batch_ids.append(expected_frame)
-                            wanted_i += 1
-
-                            if len(batch_imgs) >= self.batch_size:
-                                flush_batch()
-
-                            if progress_cb and total_wanted > 0 and wanted_i % 25 == 0:
-                                progress_cb(min(1.0, wanted_i / total_wanted), f'Embedding frames ({wanted_i}/{total_wanted})')
-
-                    flush_batch()
-                    cap.release()
-
-                    self._log.info('Frame embedding complete (%d cached).', len(self.cache))
-
-                # --- Similarity helpers ---
-
-                def _pairwise_median_similarity(self, pre_vecs, post_vecs) -> float:
-                    import torch
-                    pre = torch.stack(pre_vecs, dim=0)
-                    post = torch.stack(post_vecs, dim=0)
-                    sim = pre @ post.T
-                    val = float(sim.flatten().median().item())
-                    if getattr(self, 'val_model', 'DINOv3') == 'TIPSv2':
-                        val = 1.0 - (1.0 - val) * 4.0
-                    return val
-
-                def _avg_adjacent_similarity(self, vecs) -> float:
-                    import torch
-                    if len(vecs) < 2:
-                        return 1.0
-                    mat = torch.stack(vecs, dim=0)
-                    sims = (mat[:-1] * mat[1:]).sum(dim=1)
-                    val = float(sims.mean().item())
-                    if getattr(self, 'val_model', 'DINOv3') == 'TIPSv2':
-                        val = 1.0 - (1.0 - val) * 4.0
-                    return val
-
-                @staticmethod
-                def _otsu_threshold(scores, bins: int = 128) -> float:
-                    import numpy as np
-                    scores = np.clip(scores.astype(np.float32), 0.0, 1.0)
-                    hist, bin_edges = np.histogram(scores, bins=bins, range=(0.0, 1.0))
-                    hist = hist.astype(np.float32)
-
-                    weight1 = np.cumsum(hist)
-                    weight2 = np.cumsum(hist[::-1])[::-1]
-
-                    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-                    mean1 = np.cumsum(hist * bin_centers) / np.maximum(weight1, 1e-6)
-                    mean2 = (np.cumsum((hist * bin_centers)[::-1]) / np.maximum(weight2[::-1], 1e-6))[::-1]
-
-                    between = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
-                    if between.size == 0:
-                        return float(DinoCutValidator.DEFAULT_BASE_THRESHOLD)
-
-                    k = int(np.nanargmax(between))
-                    return float(bin_centers[k])
-
-                def _auto_threshold(self, cut_scores) -> float:
-                    import numpy as np
-                    if len(cut_scores) < 10:
-                        return float(self.DEFAULT_BASE_THRESHOLD)
-
-                    s = np.array(cut_scores, dtype=np.float32)
-                    if np.std(s) < 0.01:
-                        return float(np.clip(float(np.mean(s)) + 0.01, 0.86, 0.93))
-
-                    t_otsu = self._otsu_threshold(s)
-                    p75 = float(np.percentile(s, 75))
-                    p90 = float(np.percentile(s, 90))
-
-                    thr = max(p75, min(t_otsu, p90))
-                    return float(np.clip(thr, 0.80, 0.94))
-
-                def _window_indices(self, cut_frame: int, window: int, gap: int, total_frames: int):
-                    pre_end = max(0, cut_frame - gap)
-                    pre_start = max(0, pre_end - window)
-                    post_start = min(total_frames, cut_frame + gap)
-                    post_end = min(total_frames, post_start + window)
-                    return list(range(pre_start, pre_end)), list(range(post_start, post_end))
-
-                # --- Flash detection ---
-
-                @staticmethod
-                def _mad(values, center):
-                    import numpy as np
-                    arr = np.asarray(values, dtype=np.float32)
-                    return float(np.median(np.abs(arr - float(center))))
-
-                @staticmethod
-                def _longest_consecutive_run(idxs):
-                    """Return the indices belonging to the longest consecutive run."""
-                    if not idxs:
-                        return []
-                    idxs = sorted(set(int(x) for x in idxs))
-                    best = [idxs[0]]
-                    cur = [idxs[0]]
-                    for x in idxs[1:]:
-                        if x == cur[-1] + 1:
-                            cur.append(x)
-                        else:
-                            if len(cur) > len(best):
-                                best = cur
-                            cur = [x]
-                    if len(cur) > len(best):
-                        best = cur
-                    return best
-
-                def _detect_flash_event(self, cut_frame: int, total_frames: int):
-                    """Detect flash/black-flash near a cut boundary using median + MAD.
-
-                    Returns dict:
-                      is_flash: bool
-                      conf: 0..1
-                      kind: 'bright'|'dark'|None
-                      amp: float
-                      dur: int
-                      drift: float (pre/post baseline difference)
-                      baseline_pre/baseline_post/baseline: floats
-                      spike_frames: list[int] (frames to exclude)
-                    """
-                    import numpy as np
-
-                    def clamp(i: int) -> int:
-                        return int(max(0, min(total_frames - 1, i)))
-
-                    # Build windows
-                    center_ids = [clamp(cut_frame + k) for k in range(-self.FLASH_CENTER, self.FLASH_CENTER + 1)]
-                    pre_base_ids = [clamp(cut_frame + k) for k in range(-self.FLASH_SCAN, -self.FLASH_BASE_GAP)]
-                    post_base_ids = [clamp(cut_frame + k) for k in range(self.FLASH_BASE_GAP, self.FLASH_SCAN + 1)]
-
-                    base_vals_pre = [self._flash_signal(i) for i in pre_base_ids]
-                    base_vals_pre = [v for v in base_vals_pre if v is not None]
-                    base_vals_post = [self._flash_signal(i) for i in post_base_ids]
-                    base_vals_post = [v for v in base_vals_post if v is not None]
-
-                    if len(base_vals_pre) + len(base_vals_post) < 6:
-                        return {
-                            'is_flash': False, 'conf': 0.0, 'kind': None, 'amp': 0.0, 'dur': 0, 'drift': None,
-                            'baseline_pre': None, 'baseline_post': None, 'baseline': None, 'spike_frames': []
-                        }
-
-                    baseline_pre = float(np.median(base_vals_pre)) if base_vals_pre else float(np.median(base_vals_post))
-                    baseline_post = float(np.median(base_vals_post)) if base_vals_post else float(np.median(base_vals_pre))
-                    baseline = float(np.median([baseline_pre, baseline_post]))
-                    drift = float(abs(baseline_pre - baseline_post))
-
-                    base_vals = base_vals_pre + base_vals_post
-                    mad = self._mad(base_vals, baseline)
-                    mad = float(max(1.0, 1.4826 * mad))  # robust scale (avoid div0)
-
-                    center_vals = [(i, self._flash_signal(i)) for i in center_ids]
-                    center_vals = [(i, v) for (i, v) in center_vals if v is not None]
-                    if not center_vals:
-                        return {
-                            'is_flash': False, 'conf': 0.0, 'kind': None, 'amp': 0.0, 'dur': 0, 'drift': drift,
-                            'baseline_pre': baseline_pre, 'baseline_post': baseline_post, 'baseline': baseline, 'spike_frames': []
-                        }
-
-                    # Determine whether we have a bright or dark outlier.
-                    pos = [(i, float(v) - baseline) for (i, v) in center_vals]
-                    neg = [(i, baseline - float(v)) for (i, v) in center_vals]
-                    pos_max = max(d for _, d in pos)
-                    neg_max = max(d for _, d in neg)
-
-                    kind = 'bright' if pos_max >= neg_max else 'dark'
-                    deltas = pos if kind == 'bright' else neg
-                    amp = float(max(d for _, d in deltas))
-
-                    # Sensitivity: require some absolute amplitude, plus robust z-score.
-                    amp_thr = float(max(10.0, 0.6 * self.flash_luma_delta))
-                    z = float(amp / mad)
-
-                    # Candidate spike frames (within center)
-                    spike = [i for (i, d) in deltas if d >= max(amp_thr, 0.45 * amp_thr) and (d / mad) >= 2.8]
-                    spike_run = self._longest_consecutive_run(spike)
-                    dur = int(len(spike_run))
-
-                    boundary_hit = any(abs(i - cut_frame) <= 1 for i in spike_run)
-
-                    # Return-to-baseline: allow some drift proportional to amplitude.
-                    # Lightning storms can shift exposure a bit; use ratio rather than a fixed cutoff.
-                    if amp <= 1e-3:
-                        return_ok = False
-                    else:
-                        return_ok = bool(drift <= max(12.0, 0.60 * amp))
-
-                    # Confidence
-                    amp_score = (amp - amp_thr) / max(1e-6, (1.8 * amp_thr))
-                    amp_score = float(np.clip(amp_score, 0.0, 1.0))
-                    z_score = float(np.clip((z - 3.0) / 3.5, 0.0, 1.0))
-
-                    if dur <= 0:
-                        dur_score = 0.0
-                    elif dur <= 3:
-                        dur_score = 1.0
-                    elif dur <= 6:
-                        dur_score = 0.85
-                    elif dur <= self.FLASH_MAX_DUR:
-                        # Longer flashes are still valid; give a slightly lower but positive weight.
-                        dur_score = 0.70
-                    else:
-                        dur_score = 0.0
-
-                    if amp <= 1e-3:
-                        return_score = 0.0
-                    else:
-                        ratio = drift / amp
-                        if ratio <= 0.30:
-                            return_score = 1.0
-                        elif ratio <= 0.60:
-                            return_score = 0.7
-                        elif ratio <= 1.00:
-                            return_score = 0.25
-                        else:
-                            return_score = 0.0
-
-                    conf = float(np.clip(0.52 * amp_score + 0.15 * z_score + 0.18 * dur_score + 0.15 * return_score, 0.0, 1.0))
-                    if not boundary_hit:
-                        conf *= 0.5
-
-                    is_flash = bool(
-                        conf >= 0.55 and boundary_hit and (self.FLASH_MIN_DUR <= dur <= self.FLASH_MAX_DUR)
-                    )
-
-                    # Exclusion frames: spike run + 1-frame padding
-                    spike_frames = sorted(set([clamp(i + k) for i in spike_run for k in (-1, 0, 1)]))
-
-                    return {
-                        'is_flash': is_flash,
-                        'conf': conf,
-                        'kind': kind if is_flash else None,
-                        'amp': amp,
-                        'dur': dur,
-                        'drift': drift,
-                        'baseline_pre': baseline_pre,
-                        'baseline_post': baseline_post,
-                        'baseline': baseline,
-                        'spike_frames': spike_frames,
-                        'z': z,
-                        'amp_thr': amp_thr,
-                        'boundary_hit': boundary_hit,
-                        'return_ok': return_ok,
-                    }
-
-                def _stable_indices(self, indices, flash_event):
-                    """Remove flash frames + lingering outliers from similarity windows."""
-                    if not indices:
-                        return []
-                    if not flash_event or not flash_event.get('is_flash', False):
-                        return list(indices)
-
-                    baseline = flash_event.get('baseline')
-                    amp = float(flash_event.get('amp') or 0.0)
-                    kind = flash_event.get('kind')
-                    spike_frames = set(int(i) for i in flash_event.get('spike_frames') or [])
-
-                    kept = []
-                    for i in indices:
-                        if i in spike_frames:
-                            continue
-                        sig = self._flash_signal(i)
-                        if sig is None or baseline is None or amp <= 1e-6:
-                            kept.append(i)
-                            continue
-                        # Remove "afterglow" frames that are still far from baseline.
-                        if kind == 'bright':
-                            if float(sig) > float(baseline) + 0.40 * amp:
-                                continue
-                        elif kind == 'dark':
-                            if float(sig) < float(baseline) - 0.40 * amp:
-                                continue
-                        kept.append(i)
-                    return kept
-
-                def _flash_side_decision(self, cut_frame: int, total_frames: int, flash_event: dict):
-                    """Decide which side should own the flash frames based on similarity."""
-                    if not flash_event or not flash_event.get('is_flash', False):
-                        return None
-                    spike = [int(i) for i in (flash_event.get('spike_frames') or [])]
-                    if not spike:
-                        return None
-
-                    # First, use spike distribution around the cut if unambiguous.
-                    pre_count = sum(1 for i in spike if i < cut_frame)
-                    post_count = sum(1 for i in spike if i >= cut_frame)
-                    if pre_count > post_count:
-                        return 'pre'
-                    if post_count > pre_count:
-                        return 'post'
-
-                    flash_vecs = [self.cache[i] for i in spike if i in self.cache]
-                    if not flash_vecs:
-                        return None
-
-                    pre_ids = self._select_stable_indices_near_cut(cut_frame, total_frames, 'pre', flash_event)
-                    post_ids = self._select_stable_indices_near_cut(cut_frame, total_frames, 'post', flash_event)
-                    pre_vecs = [self.cache[i] for i in pre_ids if i in self.cache]
-                    post_vecs = [self.cache[i] for i in post_ids if i in self.cache]
-
-                    if not pre_vecs and not post_vecs:
-                        return None
-                    if pre_vecs and not post_vecs:
-                        return 'pre'
-                    if post_vecs and not pre_vecs:
-                        return 'post'
-
-                    pre_sim = self._pairwise_median_similarity(flash_vecs, pre_vecs)
-                    post_sim = self._pairwise_median_similarity(flash_vecs, post_vecs)
-
-                    if pre_sim >= post_sim:
-                        return 'pre'
-                    return 'post'
-
-                def _adjust_cut_for_flash(self, cut_frame: int, total_frames: int, flash_event: dict, cur_start_f: int, nxt_end_f: int) -> int:
-                    """Move cut to keep flash frames on the most similar side."""
-                    side = self._flash_side_decision(cut_frame, total_frames, flash_event)
-                    if side is None:
-                        return int(cut_frame)
-                    spike = [int(i) for i in (flash_event.get('spike_frames') or [])]
-                    if not spike:
-                        return int(cut_frame)
-                    flash_start = min(spike)
-                    flash_end = max(spike)
-
-                    if side == 'pre':
-                        new_cut = int(flash_end + 1)
-                    else:
-                        new_cut = int(flash_start)
-
-                    min_cut = int(cur_start_f) + 1
-                    max_cut = int(nxt_end_f) - 1
-                    if min_cut > max_cut:
-                        return int(cut_frame)
-                    if new_cut < min_cut:
-                        new_cut = min_cut
-                    if new_cut > max_cut:
-                        new_cut = max_cut
-                    return int(new_cut)
-
-                # --- Cut features + decision ---
-
-                def _cut_features(self, cut_frame: int, window: int, total_frames: int, video_path: str = None):
-                    gap = max(2, int(max(3, window // 2)))
-                    w_small = max(2, int(window))
-                    w_large = int(min(max(w_small * 3, w_small + 2), self.MAX_LARGE_WINDOW))
-
-                    pre_s, post_s = self._window_indices(cut_frame, w_small, gap, total_frames)
-                    pre_l, post_l = self._window_indices(cut_frame, w_large, gap, total_frames)
-
-                    pre_adj = cut_frame - 1
-                    post_adj = cut_frame
-
-                    def vecs_for(indices):
-                        return [self.cache[i] for i in indices if i in self.cache]
-
-                    pre_vecs_s = vecs_for(pre_s)
-                    post_vecs_s = vecs_for(post_s)
-                    pre_vecs_l = vecs_for(pre_l)
-                    post_vecs_l = vecs_for(post_l)
-
-                    if len(pre_vecs_s) < 2 or len(post_vecs_s) < 2:
-                        return None
-
-                    s_small_raw = self._pairwise_median_similarity(pre_vecs_s, post_vecs_s)
-                    s_large_raw = None
-                    if len(pre_vecs_l) >= 2 and len(post_vecs_l) >= 2:
-                        s_large_raw = self._pairwise_median_similarity(pre_vecs_l, post_vecs_l)
-
-                    s_comb_raw = float(s_small_raw) if s_large_raw is None else float(0.65 * s_small_raw + 0.35 * s_large_raw)
-
-                    s_adj = None
-                    if pre_adj in self.cache and post_adj in self.cache:
-                        s_adj = float((self.cache[pre_adj] * self.cache[post_adj]).sum().item())
-                        if getattr(self, 'val_model', 'DINOv3') == 'TIPSv2':
-                            s_adj = 1.0 - (1.0 - s_adj) * 4.0
-
-                    pre_cont = self._avg_adjacent_similarity(pre_vecs_s)
-                    post_cont = self._avg_adjacent_similarity(post_vecs_s)
-                    cont = float(min(pre_cont, post_cont))
-                    motion = float(max(0.0, 1.0 - cont))
-
-                    flash_event = self._detect_flash_event(cut_frame, total_frames)
-
-                    s_sscd = None
-                    if (video_path is not None) and (getattr(self, 'sscd_model', None) is not None) and flash_event.get('is_flash', False):
-                        try:
-                            s_sscd = self._sscd_stable_similarity(video_path, cut_frame, total_frames, flash_event)
-                        except Exception as e:
-                            self._log.debug('SSCD similarity failed at cut@%d: %s', cut_frame, e)
-                            s_sscd = None
-
-
-                    s_small_stable = None
-                    s_large_stable = None
-                    s_comb_stable = None
-                    used_stable = False
-
-                    if flash_event.get('is_flash', False):
-                        used_stable = True
-                        pre_s_st = self._stable_indices(pre_s, flash_event)
-                        post_s_st = self._stable_indices(post_s, flash_event)
-                        pre_l_st = self._stable_indices(pre_l, flash_event)
-                        post_l_st = self._stable_indices(post_l, flash_event)
-
-                        pre_vecs_s_st = vecs_for(pre_s_st)
-                        post_vecs_s_st = vecs_for(post_s_st)
-                        if len(pre_vecs_s_st) >= 2 and len(post_vecs_s_st) >= 2:
-                            s_small_stable = self._pairwise_median_similarity(pre_vecs_s_st, post_vecs_s_st)
-
-                        pre_vecs_l_st = vecs_for(pre_l_st)
-                        post_vecs_l_st = vecs_for(post_l_st)
-                        if len(pre_vecs_l_st) >= 2 and len(post_vecs_l_st) >= 2:
-                            s_large_stable = self._pairwise_median_similarity(pre_vecs_l_st, post_vecs_l_st)
-
-                        if s_small_stable is not None:
-                            if s_large_stable is None:
-                                s_comb_stable = float(s_small_stable)
-                            else:
-                                s_comb_stable = float(0.65 * float(s_small_stable) + 0.35 * float(s_large_stable))
-
-                    if s_comb_stable is None:
-                        s_comb_stable = float(s_comb_raw)
-
-                    # Pixel cue on representative stable frames
-                    def get_hist(cands):
-                        for i in cands:
-                            if 0 <= i < total_frames and i in self.hist_cache:
-                                return self.hist_cache[i]
-                        return None
-
-                    # Prefer frames near the boundary but outside typical flash band
-                    pre_hist = get_hist([cut_frame - 4, cut_frame - 5, cut_frame - 3, cut_frame - 6])
-                    post_hist = get_hist([cut_frame + 4, cut_frame + 5, cut_frame + 3, cut_frame + 6])
-                    pixel_sim = self._hist_intersection(pre_hist, post_hist)
-                    if pixel_sim != pixel_sim:
-                        pixel_sim = None
-
-                    return {
-                        's_small_raw': float(s_small_raw),
-                        's_large_raw': None if s_large_raw is None else float(s_large_raw),
-                        's_comb_raw': float(s_comb_raw),
-                        's_small_stable': None if s_small_stable is None else float(s_small_stable),
-                        's_large_stable': None if s_large_stable is None else float(s_large_stable),
-                        's_comb_stable': float(s_comb_stable),
-                        's_sscd': None if s_sscd is None else float(s_sscd),
-                        's_adj': None if s_adj is None else float(s_adj),
-                        'pre_cont': float(pre_cont),
-                        'post_cont': float(post_cont),
-                        'cont': float(cont),
-                        'motion': float(motion),
-                        'pixel_sim': None if pixel_sim is None else float(pixel_sim),
-                        'used_stable': bool(used_stable),
-                        'flash': flash_event,
-                        'gap': int(gap),
-                        'w_small': int(w_small),
-                        'w_large': int(w_large),
-                    }
-
-                def validate_cut(self, scene_index: int, cut_frame: int, window: int, total_frames: int, base_thr: float, video_path: str = None, return_feats: bool = False):
-                    """Return True if it is a true cut (KEEP), False if it should be merged (MERGE)."""
-                    feats = self._cut_features(cut_frame, window, total_frames, video_path=video_path)
-                    if feats is None:
-                        return (True, None) if return_feats else True
-
-                    s_raw = float(feats['s_comb_raw'])
-                    s_stable = float(feats['s_comb_stable'])
-                    s_sscd = feats.get('s_sscd', None)
-                    s_adj = feats.get('s_adj')
-                    cont = float(feats.get('cont', 1.0))
-                    motion = float(feats.get('motion', 0.0))
-                    pixel_sim = feats.get('pixel_sim')
-
-                    flash = feats.get('flash') or {}
-                    is_flash = bool(flash.get('is_flash', False))
-                    flash_conf = float(flash.get('conf', 0.0) or 0.0)
-                    flash_amp = float(flash.get('amp', 0.0) or 0.0)
-                    flash_dur = int(flash.get('dur', 0) or 0)
-                    flash_drift = flash.get('drift', None)
-
-                    decision_keep = True
-                    reason = 'default_keep'
-                    sscd_decision_lock = False
-
-                    ambiguous_non_flash = False
-                    high_sim_non_flash = False
-                    if not is_flash:
-                        # Ambiguous when DINO is near threshold or cues disagree (loosened).
-                        near_thr = abs(float(s_raw) - float(base_thr)) <= 0.10
-                        adj_amb = (s_adj is not None) and (0.60 <= float(s_adj) <= 0.90) and (float(s_raw) >= float(base_thr) - 0.08)
-                        pix_amb = (
-                            (pixel_sim is None)
-                            or (float(pixel_sim) < (self.PIXEL_HIST_STRONG + 0.04))
-                        )
-                        mot_amb = (float(motion) >= 0.20) and (float(s_raw) >= float(base_thr) - 0.08)
-                        high_sim_non_flash = float(s_raw) >= float(base_thr) + 0.01
-                        ambiguous_non_flash = bool(near_thr or adj_amb or mot_amb)
-
-                    # Evaluate SSCD for flash cuts or ambiguous/high-sim non-flash cuts.
-                    if (s_sscd is None) and (video_path is not None) and (getattr(self, 'sscd_model', None) is not None):
-                        if is_flash or ambiguous_non_flash or high_sim_non_flash:
-                            try:
-                                s_sscd = self._sscd_stable_similarity(video_path, cut_frame, total_frames, flash)
-                            except Exception as e:
-                                self._log.debug('SSCD similarity failed at cut@%d: %s', cut_frame, e)
-                                s_sscd = None
-                            feats['s_sscd'] = None if s_sscd is None else float(s_sscd)
-
-                    # 1) Flash path: default MERGE on confident flash unless strong cut evidence exists.
-                    if is_flash:
-                        # Higher confidence threshold to prevent false merges
-                        min_flash_conf = 0.55
-                        if s_sscd is not None:
-                            min_flash_conf = 0.45
-
-                        # Strong cut evidence overrides flash-merge default
-                        low_cut_thr = max(0.60, min(0.74, float(base_thr) - 0.16 - 0.08 * motion))
-                        s_cut = float(min(s_raw, s_stable))
-                        strong_signals = 0
-
-                        if (s_adj is not None) and (float(s_adj) < (self.ADJ_STRONG_CUT - 0.04)):
-                            strong_signals += 1
-                        if s_cut < low_cut_thr:
-                            strong_signals += 1
-                        if (pixel_sim is not None) and (float(pixel_sim) < 0.06):
-                            strong_signals += 1
-                        if s_sscd is not None:
-                            try:
-                                if float(s_sscd) < 0.62:
-                                    strong_signals += 1
-                            except Exception:
-                                pass
-
-                        # Require fewer strong indicators before keeping a flash cut.
-                        # Fix: Don't allow low s_cut (windowed) to force a KEEP if s_adj is high (meaning immediate neighbors are similar)
-                        s_cut_force = (s_cut < (low_cut_thr - 0.08))
-                        if (s_adj is not None) and (float(s_adj) >= 0.78):
-                            s_cut_force = False
-
-                        strong_cut = (strong_signals >= 2) or (
-                            (s_adj is not None and float(s_adj) < (self.ADJ_STRONG_CUT - 0.10))
-                        ) or s_cut_force
-
-                        if flash_conf >= min_flash_conf:
-                            if strong_cut:
-                                decision_keep = True
-                                reason = 'keep_flash_strong_cut'
-                            else:
-                                decision_keep = False
-                                reason = 'merge_flash_default'
-                        else:
-                            decision_keep = True
-                            reason = 'keep_flash_low_conf'
-
-                    # 2) Non-flash ambiguous/high-sim: use SSCD as tie-breaker
-                    if decision_keep and (not is_flash) and (ambiguous_non_flash or high_sim_non_flash) and (s_sscd is not None):
-                        try:
-                            req_sscd = float(max(0.62, min(0.84, self._sscd_required_sim(motion) - 0.04)))
-                            if float(s_sscd) >= req_sscd:
-                                decision_keep = False
-                                reason = 'merge_same_shot_sscd'
-                                sscd_decision_lock = True
-                            elif float(s_sscd) <= (req_sscd - 0.10):
-                                # Only keep if multiple cues indicate a real cut.
-                                cut_like = 0
-                                if (s_adj is not None) and (float(s_adj) < 0.76):
-                                    cut_like += 1
-                                if cont < 0.84:
-                                    cut_like += 1
-                                if (pixel_sim is not None) and (float(pixel_sim) < 0.06):
-                                    cut_like += 1
-                                if s_raw < (float(base_thr) - 0.10):
-                                    cut_like += 1
-                                if cut_like >= 2:
-                                    decision_keep = True
-                                    reason = 'keep_cut_sscd'
-                                    sscd_decision_lock = True
-                        except Exception:
-                            pass
-
-                    # 2b) Non-flash moderate continuity merge: reduce false keeps
-                    if decision_keep and (not is_flash) and (not sscd_decision_lock):
-                        mid_cont = (
-                            (cont >= 0.92)
-                            and ((s_adj is None) or (float(s_adj) >= 0.88))
-                            and (s_raw >= (float(base_thr) - 0.06))
-                            and ((pixel_sim is not None) and (float(pixel_sim) >= 0.16))
-                        )
-                        if mid_cont:
-                            decision_keep = False
-                            reason = 'merge_same_shot_continuity_mid'
-                        else:
-                            # High pixel similarity can override lower s_raw when continuity is strong.
-                            hi_pix_merge = (
-                                (pixel_sim is not None)
-                                and (float(pixel_sim) >= 0.22)
-                                and (cont >= 0.90)
-                                and ((s_adj is None) or (float(s_adj) >= 0.86))
-                                and (s_raw >= (float(base_thr) - 0.14))
-                            )
-                            if hi_pix_merge:
-                                decision_keep = False
-                                reason = 'merge_same_shot_pixel'
-
-                    # 2c) Non-flash high-continuity merge: reduce false keeps
-                    if decision_keep and (not is_flash) and (not sscd_decision_lock):
-                        high_cont = (
-                            (cont >= 0.94)
-                            and ((s_adj is None) or (float(s_adj) >= 0.92))
-                            and (s_raw >= (float(base_thr) - 0.03))
-                            and ((pixel_sim is not None) and (float(pixel_sim) >= 0.16))
-                        )
-                        if high_cont:
-                            decision_keep = False
-                            reason = 'merge_same_shot_continuity'
-                            
-                    # 2d) Removed: High Adjacent Merge was causing false positives
-
-                    # 3) Non-flash: strong adjacent discontinuity => KEEP (unless SSCD decided)
-                    if (not sscd_decision_lock) and decision_keep and (s_adj is not None) and (float(s_adj) < self.ADJ_STRONG_CUT):
-                        decision_keep = True
-                        reason = 'adj_strong_cut'
-
-                    # 4) Non-flash false-positive merge path (fast motion / shaky camera):
-                    if decision_keep and (not is_flash) and (not sscd_decision_lock):
-                        # Must be near within-shot continuity and above a conservative absolute threshold.
-                        req_rel = max(0.82, cont - 0.06)
-                        req_abs = max(0.86, min(0.92, float(base_thr)))
-                        req = float(max(req_rel, req_abs))
-
-                        pix_ok = (pixel_sim is not None and float(pixel_sim) >= self.PIXEL_HIST_STRONG)
-                        if (s_raw >= req) and pix_ok and ((s_adj is None) or float(s_adj) >= 0.78):
-                            decision_keep = False
-                            reason = 'merge_same_shot'
-
-                    decision = (
-                        f"{self.BOLD}{self.KEEP_FG}KEEP{self.RESET}"
-                        if decision_keep
-                        else f"{self.BOLD}{self.MERG_FG}MERGE{self.RESET}"
-                    )
-
-                    self._log.debug(
-                        'Scene #%d cut@%d | s_raw=%.3f s_stable=%.3f s_sscd=%s s_adj=%s cont=%.3f motion=%.3f pixel=%s '
-                        'flash=%s(%.2f) amp=%.1f dur=%d drift=%s -> %s (%s)',
-                        scene_index,
-                        cut_frame,
-                        s_raw,
-                        s_stable,
-                        '{:.3f}'.format(s_sscd) if s_sscd is not None else 'n/a',
-                        '{:.3f}'.format(s_adj) if s_adj is not None else 'n/a',
-                        cont,
-                        motion,
-                        '{:.3f}'.format(pixel_sim) if pixel_sim is not None else 'n/a',
-                        'Y' if is_flash else 'N',
-                        flash_conf,
-                        flash_amp,
-                        flash_dur,
-                        '{:.1f}'.format(float(flash_drift)) if flash_drift is not None else 'n/a',
-                        decision,
-                        reason,
-                    )
-
-                    return (decision_keep, feats) if return_feats else decision_keep
-
-                def filter_scenes(self, video_path: str, scenes: list, window: int, abort_flag=None, progress_cb=None) -> list:
-                    import cv2
-
-                    if len(scenes) < 2:
-                        return scenes
-
-                    cap = cv2.VideoCapture(video_path)
-                    self.total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-                    cap.release()
-
-                    if self.total_video_frames <= 0:
-                        self._log.warning('Could not determine frame count for AI validation; skipping.')
-                        return scenes
-
-                    all_indices = set()
-                    cut_frames = []
-                    for _, end_tc in scenes[:-1]:
-                        cut = int(end_tc.get_frames())
-                        cut_frames.append(cut)
-
-                    w = int(window)
-                    gap = max(2, int(max(3, w // 2)))
-                    w_small = max(2, w)
-                    w_large = int(min(max(w_small * 3, w_small + 2), self.MAX_LARGE_WINDOW))
-
-                    for cut in cut_frames:
-                        # Flash analysis window
-                        for k in range(-self.FLASH_SCAN, self.FLASH_SCAN + 1):
-                            all_indices.add(max(0, min(self.total_video_frames - 1, cut + k)))
-
-                        pre_s, post_s = self._window_indices(cut, w_small, gap, self.total_video_frames)
-                        all_indices.update(pre_s); all_indices.update(post_s)
-
-                        pre_l, post_l = self._window_indices(cut, w_large, gap, self.total_video_frames)
-                        all_indices.update(pre_l); all_indices.update(post_l)
-
-                    self._embed_all_required_frames(
-                        video_path,
-                        sorted(all_indices),
-                        abort_flag=abort_flag,
-                        progress_cb=progress_cb,
-                    )
-
-                    cut_scores = []
-                    for i, cut in enumerate(cut_frames, start=1):
-                        feats = self._cut_features(cut, w, self.total_video_frames)
-                        if feats is None:
-                            continue
-                        cut_scores.append(float(feats['s_comb_raw']))
-                        if progress_cb and i % 10 == 0:
-                            progress_cb(min(1.0, i / max(1, len(cut_frames))), f'Analyzing cut scores ({i}/{len(cut_frames)})')
-
-                    base_thr = self._auto_threshold(cut_scores)
-                    self._log.info(
-                        'AI validation adaptive same-shot threshold: base_thr=%.3f (window=%d, gap=%d, large=%d)',
-                        base_thr,
-                        w,
-                        gap,
-                        w_large,
-                    )
-
-                    validated_scenes = []
-                    cur_start, cur_end = scenes[0]
-
-                    for i in range(1, len(scenes)):
-                        nxt_start, nxt_end = scenes[i]
-                        cut_frame_num = int(nxt_start.get_frames())
-                        cur_len = int(cur_end.get_frames() - cur_start.get_frames())
-                        nxt_len = int(nxt_end.get_frames() - nxt_start.get_frames())
-
-                        if abort_flag is not None and abort_flag.is_set():
-                            raise InterruptedError
-
-                        keep_cut, feats = self.validate_cut(
-                            scene_index=i,
-                            cut_frame=cut_frame_num,
-                            window=w,
-                            total_frames=self.total_video_frames,
-                            base_thr=base_thr,
-                            video_path=video_path,
-                            return_feats=True,
-                        )
-
-                        flash = (feats or {}).get('flash') or {}
-                        is_flash = bool(flash.get('is_flash', False))
-                        flash_conf = float(flash.get('conf', 0.0) or 0.0)
-                        s_sscd = (feats or {}).get('s_sscd')
-                        s_stable = float((feats or {}).get('s_comb_stable', (feats or {}).get('s_comb_raw', 0.0)) or 0.0)
-                        spike_frames = flash.get('spike_frames') or []
-                        boundary_hit = bool(flash.get('boundary_hit', False))
-
-                        min_flash_conf = 0.40
-                        if s_sscd is not None:
-                            min_flash_conf = 0.35
-
-                        # Preserve very short scenes by default unless this is a flash-like cut with strong same-shot evidence.
-                        if cur_len <= short_guard_frames or nxt_len <= short_guard_frames:
-                            flash_like = bool(spike_frames) and boundary_hit and (flash_conf >= 0.35)
-                            same_shot = float(s_stable) >= max(0.0, float(base_thr) - 0.05)
-                            if flash_like and same_shot:
-                                keep_cut = False
-                            elif not (is_flash and flash_conf >= min_flash_conf):
-                                keep_cut = True
-
-                        if keep_cut:
-                            # If it is a flash but we keep the cut, snap the boundary to the best side.
-                            if is_flash and flash_conf >= min_flash_conf:
-                                new_cut = self._adjust_cut_for_flash(
-                                    cut_frame=cut_frame_num,
-                                    total_frames=self.total_video_frames,
-                                    flash_event=flash,
-                                    cur_start_f=int(cur_start.get_frames()),
-                                    nxt_end_f=int(nxt_end.get_frames()),
-                                )
-                                if new_cut != cut_frame_num:
-                                    cur_end = Timecode(int(new_cut), cur_start.fps)
-                                    nxt_start = Timecode(int(new_cut), cur_start.fps)
-
-                            validated_scenes.append((cur_start, cur_end))
-                            cur_start, cur_end = nxt_start, nxt_end
-                        else:
-                            cur_end = nxt_end
-
-                        if progress_cb:
-                            progress_cb(min(1.0, i / max(1, len(scenes) - 1)), f'Validating cuts ({i}/{len(scenes) - 1})')
-
-                    validated_scenes.append((cur_start, cur_end))
-
-                    # Post-pass: merge tiny flash clips (mid-scene) into the most likely neighbor.
-                    try:
-                        if short_guard_frames and len(validated_scenes) >= 3:
-                            fps_local = float(validated_scenes[0][0].fps) if validated_scenes else 0.0
-                            frames = [
-                                [int(st.get_frames()), int(et.get_frames())]
-                                for st, et in validated_scenes
-                            ]
-
-                            boundary_cache = {}
-
-                            def boundary_info(cut_frame: int):
-                                if cut_frame in boundary_cache:
-                                    return boundary_cache[cut_frame]
-                                feats_b = self._cut_features(cut_frame, w, self.total_video_frames, video_path=video_path)
-                                if feats_b is None:
-                                    info = {'flash_like': False, 'score': 0.0}
-                                else:
-                                    flash_b = (feats_b or {}).get('flash') or {}
-                                    flash_conf_b = float(flash_b.get('conf', 0.0) or 0.0)
-                                    spike_b = flash_b.get('spike_frames') or []
-                                    boundary_hit_b = bool(flash_b.get('boundary_hit', False))
-                                    flash_like_b = bool(spike_b) and boundary_hit_b and (flash_conf_b >= 0.35)
-                                    s_stable_b = float((feats_b or {}).get('s_comb_stable', (feats_b or {}).get('s_comb_raw', 0.0)) or 0.0)
-                                    same_shot_b = float(s_stable_b) >= max(0.0, float(base_thr) - 0.05)
-                                    score_b = (flash_conf_b * 1.2) + (float(s_stable_b) - float(base_thr) if same_shot_b else 0.0)
-                                    info = {'flash_like': flash_like_b, 'score': score_b}
-                                boundary_cache[cut_frame] = info
-                                return info
-
-                            ultra_short_frames = max(1, int(round(float(fps_local) * 0.04))) if fps_local > 0 else 1
-                            i = 1
-                            merged_any = False
-                            while i < len(frames) - 1:
-                                seg_len = int(frames[i][1] - frames[i][0])
-                                guard_len = max(2, int(round(float(fps_local) * 0.12))) if fps_local > 0 else 2
-                                if seg_len <= guard_len:
-                                    info_pre = boundary_info(frames[i][0])
-                                    info_post = boundary_info(frames[i][1])
-                                    force_merge = seg_len <= ultra_short_frames
-                                    if force_merge or info_pre['flash_like'] or info_post['flash_like']:
-                                        if info_pre['score'] >= info_post['score']:
-                                            frames[i - 1][1] = frames[i][1]
-                                            del frames[i]
-                                            merged_any = True
-                                            continue
-                                        else:
-                                            frames[i + 1][0] = frames[i][0]
-                                            del frames[i]
-                                            merged_any = True
-                                            continue
-                                i += 1
-
-                            if merged_any:
-                                validated_scenes = [
-                                    (Timecode(st, fps_local), Timecode(et, fps_local))
-                                    for st, et in frames
-                                    if et > st
-                                ]
-                    except Exception as e:
-                        self._log.warning('Tiny flash merge post-pass failed: %s', e)
-
-                    # Release SSCD video handle (if used)
-                    try:
-                        if getattr(self, '_sscd_cap', None) is not None:
-                            self._sscd_cap.release()
-                    except Exception:
-                        pass
-                    self._sscd_cap = None
-                    self._sscd_video_path = None
-                    try:
-                        if getattr(self, '_sscd_frame_cache', None) is not None:
-                            self._sscd_frame_cache.clear()
-                    except Exception:
-                        pass
-
-                    return validated_scenes
-
-
-            v_model = self.ai_val_model_var.get()
-            v_dir = f"./weights/{v_model}"
-            
-            validator = DinoCutValidator(
-                model_dir=v_dir,
-                val_model=v_model,
-                batch_size=48,
-                flash_luma_delta=float(self.flash_sensitivity_var.get())
-            )
+            from cut_validator import CutValidator, ValidatorConfig
+
+            model_dir = "./weights/DINOv3"
+            cache_key = ("CutValidator", model_dir)
+            validator = self.loaded_models.get(cache_key)
+            if validator is None:
+                logger.info("Loading DINOv3 cut validator from %s...", model_dir)
+                validator = CutValidator(model_dir=model_dir, log=logger)
+                self.loaded_models[cache_key] = validator
+            else:
+                validator.reset_caches()
+
+            validator.cfg = ValidatorConfig(flash_luma_delta=float(self.flash_sensitivity_var.get()))
 
             def progress_cb(pct: float, msg: str):
                 # Map into the app's overall progress bar range.
@@ -2944,6 +1739,8 @@ class SceneDetectApp:
                 video_path=video_path,
                 scenes=scenes,
                 window=int(self.ai_window_var.get()),
+                short_guard_frames=short_guard_frames,
+                total_frames=int(self.total_frames or 0),
                 abort_flag=self.abort_flag,
                 progress_cb=progress_cb,
             )
@@ -2957,7 +1754,6 @@ class SceneDetectApp:
             logger.exception("AI validation failed. Skipping.")
             messagebox.showwarning("AI Validation Failed", f"Could not perform AI validation: {e}")
             return scenes
-
 
     def _merge_ultra_short_scenes(self, scenes, fps: float, total_frames: int, max_seconds: float = 0.05):
         """Merge ultra-short scenes into neighbors regardless of validation settings."""
@@ -3176,7 +1972,15 @@ class SceneDetectApp:
         logger.info("Saved thumbnails to directory: %s", images_dir)
 
     def _split_video(self, video_path: str, output_dir: str, fps: float):
-        """Split the input video into per-scene clips with frame-exact boundaries using FFmpeg (Parallel)."""
+        """Split the input video into per-scene clips, frame-exact, as 10-bit HEVC.
+
+        Video is always re-encoded to 10-bit HEVC (Main10) on the NVIDIA GPU via
+        hevc_nvenc, falling back to libx265 10-bit only when no NVENC build is
+        available. Boundaries are cut with the ``trim`` filter on decoded frame
+        indices - never on keyframes or wall-clock seeks - and timestamps are
+        rebuilt as strict CFR so every clip holds exactly the frames the
+        detector assigned to it.
+        """
         import concurrent.futures
 
         if not self.detected_scenes:
@@ -3184,29 +1988,160 @@ class SceneDetectApp:
             return
 
         total_scenes = len(self.detected_scenes)
-        logger.info(
-            "Splitting video into %d scenes (frame-exact) using parallel FFmpeg commands...",
-            total_scenes,
-        )
-
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
         # --- Capture Settings (Main Thread) ---
-        codec = self.ffmpeg_codec_var.get()
         preset = self.ffmpeg_preset_var.get()
         cq_val = str(self.ffmpeg_cq_var.get())
 
-        def probe_has_audio(path: str) -> bool:
-            try:
-                probe = subprocess.run(
-                    ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
-                    capture_output=True, text=True, creationflags=creationflags, check=False
-                )
-                return probe.returncode == 0 and bool(probe.stdout.strip())
-            except FileNotFoundError:
-                return True
+        props = probe_stream_props(video_path)
+        input_has_audio = props.get("has_audio", False)
 
-        input_has_audio = probe_has_audio(video_path)
+        # Exact rational frame rate keeps 23.976/29.97 sources from drifting.
+        fps_num, fps_den = props.get("fps_num", 0), props.get("fps_den", 0)
+        have_exact_rate = bool(fps_num and fps_den)
+        if not have_exact_rate:
+            fps_num, fps_den = int(round(float(fps) * 1000)), 1000
+        rate_arg = f"{fps_num}/{fps_den}"
+        start_time = props.get("start_time", 0.0)
+
+        # Keyframe pre-seek turns each clip into a one-GOP decode instead of a
+        # full decode from frame 0 - the difference between minutes and days on
+        # sources with thousands of scenes. It needs a trustworthy frame
+        # index <-> timestamp mapping, so it is restricted to CFR sources.
+        use_seek = have_exact_rate and props.get("is_cfr", False)
+        if not use_seek:
+            logger.warning(
+                "Source is variable frame rate or has no reliable frame rate - using "
+                "full-decode frame indexing. This is exact but slow on long sources."
+            )
+
+        use_nvenc = has_nvenc_hevc()
+        if not use_nvenc:
+            logger.warning(
+                "hevc_nvenc is unavailable in this FFmpeg build - falling back to "
+                "libx265 10-bit on the CPU (much slower)."
+            )
+
+        # Decode on NVDEC and keep frames in GPU memory all the way to NVENC, so
+        # the CPU never touches pixel data. Without this the GPU only does the
+        # encode while the CPU still decodes every frame and does the 8->10-bit
+        # conversion, which pins cores when several clips run in parallel.
+        use_hwdec = use_nvenc and can_hwdecode(video_path)
+        hwdec_lock = threading.Lock()
+        if use_nvenc and not use_hwdec:
+            logger.warning(
+                "This source cannot be decoded by NVDEC (unsupported codec or chroma "
+                "format) - decoding on the CPU. Encoding still runs on the GPU."
+            )
+        logger.info(
+            "Splitting video into %d scenes (frame-exact, 10-bit HEVC via %s, %s, %s decode) "
+            "at %s fps...",
+            total_scenes, "NVENC" if use_nvenc else "libx265",
+            "keyframe pre-seek" if use_seek else "full decode",
+            "NVDEC" if use_hwdec else "CPU", rate_arg,
+        )
+
+        def video_encoder_args(hwdec: bool) -> list:
+            if use_nvenc:
+                args = [
+                    "-c:v", "hevc_nvenc",
+                    "-preset", preset,
+                    "-tune", "hq",
+                    "-profile:v", "main10",
+                    "-rc", "constqp", "-qp", cq_val, "-b:v", "0",
+                    "-spatial-aq", "1", "-temporal-aq", "1",
+                ]
+                # With NVDEC the frames are already CUDA p010 surfaces; naming a
+                # software pix_fmt here would force a needless GPU->CPU->GPU trip.
+                if not hwdec:
+                    args += ["-pix_fmt", "p010le"]
+                return args
+            return [
+                "-c:v", "libx265",
+                "-preset", "medium",
+                "-profile:v", "main10",
+                "-pix_fmt", "yuv420p10le",
+                "-crf", cq_val,
+            ]
+
+        def color_args() -> list:
+            """Carry source colour tags forward so the 10-bit clips match the source."""
+            args = []
+            for key, flag in (
+                ("color_range", "-color_range"),
+                ("color_space", "-colorspace"),
+                ("color_transfer", "-color_trc"),
+                ("color_primaries", "-color_primaries"),
+            ):
+                if props.get(key):
+                    args += [flag, props[key]]
+            return args
+
+        def build_command(start_frame: int, end_frame: int, with_audio: bool,
+                          out_path: Path, seek: bool, hwdec: bool) -> list:
+            # Two cutting strategies, both frame-exact:
+            #
+            # seek=True (CFR sources): fast keyframe seek to just before the
+            #   scene, then select frames by their ORIGINAL timestamps under
+            #   -copyts. Decoding only touches one GOP instead of the whole file
+            #   from frame 0, which is what makes thousands of scenes tractable.
+            #   Input seeking always lands on a keyframe at or before the target,
+            #   so trimming on absolute PTS yields exactly the same frames as a
+            #   full decode no matter where the seek lands.
+            #
+            # seek=False (VFR/unknown rate): decode from frame 0 and trim on
+            #   decoded frame indices, the only correct option when frame numbers
+            #   cannot be mapped to timestamps.
+            command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+            if hwdec:
+                command += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+
+            if seek:
+                start_pts = start_time + start_frame * fps_den / fps_num
+                end_pts = start_time + end_frame * fps_den / fps_num
+                # Nudge bounds by half a frame so floating-point rounding can
+                # never straddle a frame's exact presentation time.
+                half = 0.5 * fps_den / fps_num
+                lo, hi = start_pts - half, end_pts - half
+                seek_to = max(0.0, start_pts - SEEK_MARGIN_SEC)
+                command += ["-copyts", "-ss", f"{seek_to:.9f}", "-i", video_path]
+                v_trim = f"trim=start={lo:.9f}:end={hi:.9f}"
+                a_trim = f"atrim=start={lo:.9f}:end={hi:.9f}"
+            else:
+                # trim's end_frame is exclusive, matching PySceneDetect's
+                # exclusive end timecode: the clip holds [start_frame, end_frame).
+                command += ["-i", video_path]
+                v_trim = f"trim=start_frame={start_frame}:end_frame={end_frame}"
+                a_trim = (f"atrim=start={start_frame * fps_den / fps_num:.9f}"
+                          f":end={end_frame * fps_den / fps_num:.9f}")
+
+            # setpts=N/FRAME_RATE/TB regenerates a perfectly uniform CFR ramp
+            # from the trimmed frame index, so neither the seek offset nor any
+            # source timestamp jitter can survive into the clip. trim and setpts
+            # only pass or drop frames and rewrite timestamps - they never read
+            # pixels - so both work unchanged on CUDA surfaces.
+            # The 8->10-bit conversion is the one step that touches pixels, so it
+            # runs as scale_cuda on the GPU when hardware decoding is active.
+            to_10bit = "scale_cuda=format=p010le" if hwdec else "format=p010le"
+            video_chain = f"[0:v]{v_trim},setpts=N/FRAME_RATE/TB,{to_10bit}[v]"
+            if with_audio:
+                command += ["-filter_complex",
+                            f"{video_chain};[0:a]{a_trim},asetpts=N/SR/TB[a]",
+                            "-map", "[v]", "-map", "[a]"]
+            else:
+                command += ["-filter_complex", video_chain, "-map", "[v]", "-an"]
+
+            command += video_encoder_args(hwdec)
+            command += color_args()
+            # Force CFR at the source rate: no frame may be dropped or duplicated.
+            command += ["-fps_mode", "cfr", "-r", rate_arg, "-video_track_timescale", str(fps_num)]
+            if with_audio:
+                command += ["-c:a", "aac", "-b:a", "192k"]
+            # hvc1 tag keeps HEVC playable in QuickTime/Apple/Adobe tooling.
+            command += ["-tag:v", "hvc1", "-movflags", "+faststart",
+                        "-max_muxing_queue_size", "1024", str(out_path)]
+            return command
 
         def _split_worker(packed_args):
             idx, start_tc, end_tc = packed_args
@@ -3217,67 +2152,80 @@ class SceneDetectApp:
             output_filename = Path(output_dir) / f"{Path(video_path).stem}-Scene-{scene_num:03d}.mp4"
 
             start_frame = int(start_tc.get_frames())
-            end_frame = int(end_tc.get_frames()) 
-            start_sec = float(start_tc.get_seconds())
-            end_sec = float(end_tc.get_seconds())
+            end_frame = int(end_tc.get_frames())
+            expected_frames = end_frame - start_frame
 
-            command = ["ffmpeg", "-y", "-hide_banner", "-i", video_path]
+            with_audio = input_has_audio
+            nonlocal use_hwdec
+            hwdec = use_hwdec
+            result = subprocess.run(
+                build_command(start_frame, end_frame, with_audio, output_filename, use_seek, hwdec),
+                capture_output=True, text=True, creationflags=creationflags, check=False,
+            )
 
-            if input_has_audio:
-                filter_graph = (
-                    f"[0:v]trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS[v];"
-                    f"[0:a]atrim=start={start_sec}:end={end_sec},asetpts=PTS-STARTPTS[a]"
+            # NVDEC can also fail part-way through a file (surface exhaustion, a
+            # stream switching to an unsupported format). Drop to CPU decoding
+            # once for the whole run rather than paying the failure per scene.
+            if result.returncode != 0 and hwdec:
+                logger.warning(
+                    "Scene %d: hardware decode failed, falling back to CPU decode "
+                    "for the rest of this split. FFmpeg said: %s",
+                    scene_num, (result.stderr or "").strip().splitlines()[-1:] or "",
                 )
-                command += ["-filter_complex", filter_graph, "-map", "[v]", "-map", "[a]"]
-            else:
-                filter_graph = f"[0:v]trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS[v]"
-                command += ["-filter_complex", filter_graph, "-map", "[v]"]
-
-            if "nvenc" in codec:
-                command += ["-c:v", codec, "-preset", preset, "-qp", cq_val]
-            else:
-                command += ["-c:v", codec, "-preset", "fast", "-crf", cq_val]
-
-            if input_has_audio:
-                command += ["-c:a", "aac", "-b:a", "192k"]
-
-            command += ["-movflags", "+faststart", str(output_filename)]
-
-            try:
+                with hwdec_lock:
+                    use_hwdec = False
+                hwdec = False
                 result = subprocess.run(
-                    command, capture_output=True, text=True,
-                    creationflags=creationflags, check=False
+                    build_command(start_frame, end_frame, with_audio, output_filename, use_seek, False),
+                    capture_output=True, text=True, creationflags=creationflags, check=False,
                 )
 
-                if result.returncode != 0 and input_has_audio:
-                    stderr_lower = (result.stderr or "").lower()
-                    if "matches no streams" in stderr_lower or "stream specifier" in stderr_lower:
-                        logger.warning(f"Scene {scene_num}: Audio stream issues, retrying video-only.")
-                        filter_graph = f"[0:v]trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS[v]"
-                        command_retry = ["ffmpeg", "-y", "-hide_banner", "-i", video_path,
-                                         "-filter_complex", filter_graph, "-map", "[v]"]
-                        if "nvenc" in codec:
-                            command_retry += ["-c:v", codec, "-preset", preset, "-qp", cq_val]
-                        else:
-                            command_retry += ["-c:v", codec, "-preset", "fast", "-crf", cq_val]
-                        command_retry += ["-movflags", "+faststart", str(output_filename)]
+            if result.returncode != 0 and with_audio:
+                stderr_lower = (result.stderr or "").lower()
+                if "matches no streams" in stderr_lower or "stream specifier" in stderr_lower:
+                    logger.warning("Scene %d: audio stream issues, retrying video-only.", scene_num)
+                    with_audio = False
+                    result = subprocess.run(
+                        build_command(start_frame, end_frame, False, output_filename, use_seek, hwdec),
+                        capture_output=True, text=True, creationflags=creationflags, check=False,
+                    )
 
-                        result = subprocess.run(
-                            command_retry, capture_output=True, text=True,
-                            creationflags=creationflags, check=False
-                        )
+            if result.returncode != 0:
+                logger.error("FFmpeg failed on scene %d: %s", scene_num, result.stderr)
+                raise RuntimeError(f"FFmpeg failed: {result.returncode}")
 
+            # Verify the cut really is frame-exact rather than assuming it. This
+            # is also exactly how a bad seek would show up, so a mismatch in seek
+            # mode triggers a rebuild via the full-decode path.
+            actual_frames = probe_frame_count(str(output_filename))
+            if actual_frames and actual_frames != expected_frames and use_seek:
+                logger.warning(
+                    "Scene %d: seek-mode cut produced %d frames, expected %d - "
+                    "rebuilding with full-decode frame indexing.",
+                    scene_num, actual_frames, expected_frames,
+                )
+                result = subprocess.run(
+                    build_command(start_frame, end_frame, with_audio, output_filename, False, hwdec),
+                    capture_output=True, text=True, creationflags=creationflags, check=False,
+                )
                 if result.returncode != 0:
-                    logger.error(f"FFmpeg failed on scene {scene_num}: {result.stderr}")
+                    logger.error("FFmpeg rebuild failed on scene %d: %s", scene_num, result.stderr)
                     raise RuntimeError(f"FFmpeg failed: {result.returncode}")
+                actual_frames = probe_frame_count(str(output_filename))
 
-            except Exception as e:
-                logger.error(f"Error splitting scene {scene_num}: {e}")
-                raise
+            if actual_frames and actual_frames != expected_frames:
+                logger.warning(
+                    "Scene %d frame count mismatch: expected %d, got %d.",
+                    scene_num, expected_frames, actual_frames,
+                )
+            return actual_frames, expected_frames
 
-        max_workers = min(4, os.cpu_count() or 4)
+        # NVENC allows only a handful of concurrent encode sessions on consumer
+        # GPUs, so keep the pool narrow when encoding on the GPU.
+        max_workers = 3 if use_nvenc else min(4, os.cpu_count() or 4)
         tasks = []
         completed_count = 0
+        exact_count = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             for i, (start_tc, end_tc) in enumerate(self.detected_scenes):
@@ -3290,15 +2238,20 @@ class SceneDetectApp:
                     return
 
                 try:
-                    future.result()
+                    counts = future.result()
                     completed_count += 1
+                    if counts and (counts[0] == 0 or counts[0] == counts[1]):
+                        exact_count += 1
                     pct = 85 + (completed_count / total_scenes) * 15
                     self.progress_queue.put_nowait((pct, f"Splitting scenes Parallel ({completed_count}/{total_scenes})"))
                 except Exception as e:
                     logger.error(f"Worker task failed: {e}")
                     # We continue despite errors in single scenes
-        
-        logger.info("Parallel splitting finished. Processed %d/%d scenes.", completed_count, total_scenes)
+
+        logger.info(
+            "Parallel splitting finished. Processed %d/%d scenes (%d verified frame-exact).",
+            completed_count, total_scenes, exact_count,
+        )
 
     def _process_queues(self) -> None:
         while not self.progress_queue.empty():

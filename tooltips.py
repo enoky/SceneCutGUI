@@ -44,8 +44,7 @@ TOOLTIPS: dict[str, str] = {
     "lowpass": "Amount of smoothing applied before hashing. Helps ignore minor visual noise.",
     
     # AI Validation
-    "ai_validate": "Use AI validation to validate cuts and filter out flashes/fast motion. Requires a CUDA-enabled GPU.",
-    "ai_val_model": "Select the AI model used for validation (DINOv3 or TIPSv2).",
+    "ai_validate": "Use DINOv3 AI validation to confirm cuts and filter flashes/fast motion. Requires a CUDA-enabled GPU.",
     "ai_window": "Number of frames before and after a cut to analyze for AI validation.",
     "flash_sensitivity": "Sensitivity for detecting flash spikes versus scene cuts. Lower values (15-25) detect flashes more aggressively. Default: 15.",
     
@@ -60,9 +59,10 @@ TOOLTIPS: dict[str, str] = {
     "split_ffmpeg": "Use FFmpeg to split the video into a separate file for each scene.",
     
     # FFmpeg Settings
-    "ffmpeg_codec": "Video codec for FFmpeg splitting. NVENC options require an NVIDIA GPU.",
+    "ffmpeg_codec": "Scene clips are always written as 10-bit HEVC (Main10, p010le). The full pipeline runs on the NVIDIA GPU: NVDEC decode, CUDA 8->10-bit conversion, NVENC encode, with no frame copied to system memory. Falls back to CPU decoding for sources NVDEC cannot handle, and to libx265 10-bit if this FFmpeg build has no NVENC.",
     "ffmpeg_preset": "NVENC preset. P1 is fastest (lowest quality), P7 is slowest (best quality). P5/P6 is a good balance.",
-    "ffmpeg_cq": "Constant Quality level for NVENC. Lower values mean higher quality and larger file sizes. 18-28 is a reasonable range.",
+    "ffmpeg_cq": "Constant QP level for the 10-bit HEVC encode. Lower values mean higher quality and larger file sizes. 16-24 is a reasonable range for 10-bit HEVC.",
+    "split_ffmpeg_accuracy": "Cuts land on the exact frame the detector chose, never a keyframe-rounded boundary, and clips are re-timed to strict CFR at the source's exact frame rate. On constant-frame-rate sources a keyframe pre-seek keeps the cost per clip flat, so sources with thousands of cuts stay fast; every clip's frame count is verified afterwards.",
     
     # Buttons
     "start_detection": "Start the full process: detect scenes and generate all selected outputs.",

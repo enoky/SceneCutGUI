@@ -1,6 +1,6 @@
 # SceneCutGUI
 
-A modern, GPU-accelerated scene detection and video slicing tool with an intuitive Tkinter GUI. Uses **AutoShot**, **TransNetV2** or **OmniShotCut** neural networks for highly accurate shot boundary detection, with optional **DINOv3/TIPSv2-based AI validation** to filter false positives.
+A modern, GPU-accelerated scene detection and video slicing tool with an intuitive Tkinter GUI. Uses **AutoShot**, **TransNetV2** or **OmniShotCut** neural networks for highly accurate shot boundary detection, with optional **DINOv3-based AI validation** to filter false positives.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -11,14 +11,14 @@ A modern, GPU-accelerated scene detection and video slicing tool with an intuiti
 ## ✨ Features
 
 - **AutoShot / TransNetV2 / OmniShotCut Detection** — State-of-the-art neural networks for shot boundary detection, including transition-aware detection (dissolves, wipes, fades) via OmniShotCut
-- **DINOv3/TIPSv2/SSCD AI Validation** — Optional post-processing to filter out flashes, fast motion, and near-black false positives
+- **DINOv3/SSCD AI Validation** — Optional post-processing to filter out flashes, fast motion, and near-black false positives
 - **GPU Acceleration** — CUDA support for both video decoding (OpenCV) and model inference (PyTorch)
 - **Multiple Export Formats**:
   - CSV scene list
   - HTML report
   - `.sc` scene cut file (DaVinci Resolve compatible)
   - Thumbnail images per scene
-  - FFmpeg-based video splitting with NVENC encoding
+  - FFmpeg-based video splitting: frame-perfect cuts, 10-bit HEVC via NVENC
 - **Configurable Parameters** — Fine-tune detection threshold, minimum scene length, and validation window
 - **Settings Persistence** — Automatically saves/loads your configuration
 
@@ -88,9 +88,8 @@ pip install opencv_contrib_python-4.13.0.90-cp37-abi3-win_amd64.whl
 | -------------------------------- | ------------------------------------------- |
 | `ckpt_0_200_0.pth`               | AutoShot model weights                      |
 | `transnetv2-pytorch-weights.pth` | TransNetV2 model weights                    |
-| `OmniShotCut_ckpt.pth`           | OmniShotCut model weights ([HuggingFace](https://huggingface.co/uva-cv-lab/OmniShotCut), ~164 MB) |
+| `OmniShotCut_ckpt.pth`           | OmniShotCut model weights                   |
 | `DINOv3/*`                       | DINOv3 model (for AI validation)            |
-| `TIPSv2/*`                       | TIPSv2 model (for AI validation)            |
 | `sscd_disc_large.torchscript.pt` | SSCD model (for AI validation)              |
 
 ---
@@ -145,8 +144,7 @@ by argmax over its shot queries rather than by thresholding a score, so it shows
 
 | Parameter           | Default  | Description                                    |
 | ------------------- | -------- | ---------------------------------------------- |
-| `ai_validate`       | `false`  | Enable DINOv3/TIPSv2/SSCD validation           |
-| `ai_val_model`      | `DINOv3` | Model used for validation (DINOv3 or TIPSv2)   |
+| `ai_validate`       | `false`  | Enable DINOv3/SSCD validation                  |
 | `ai_window`         | `5`      | Frames before/after cut to analyze             |
 | `flash_sensitivity` | `15`     | Luma delta threshold for flash detection       |
 
@@ -159,11 +157,71 @@ by argmax over its shot queries rather than by thresholding a score, so it shows
 
 ### FFmpeg Output Settings
 
+Scene clips are always written as **10-bit HEVC (Main10, `p010le`)** encoded on the
+NVIDIA GPU via `hevc_nvenc`. The codec is not user-selectable; if the installed
+FFmpeg build has no NVENC support, splitting falls back automatically to CPU
+`libx265` 10-bit. Clips are tagged `hvc1` for QuickTime/Apple/Adobe compatibility,
+and source colour range/space/transfer/primaries are carried through unchanged.
+
+**The whole pipeline runs on the GPU**, not just the encode: frames are decoded by
+NVDEC, stay in GPU memory through the trim, and the 8→10-bit conversion is done by
+`scale_cuda` before going straight into NVENC — no frame is ever copied to system
+memory. `trim` and `setpts` only pass/drop frames and rewrite timestamps, so they
+work unchanged on CUDA surfaces. Sources NVDEC cannot handle (4:2:2 chroma, ProRes,
+DNxHD, AV1 on older GPUs) are detected up front with a one-frame test decode and
+fall back to CPU decoding, with encoding still on the GPU.
+
 | Parameter       | Default      | Description                                         |
 | --------------- | ------------ | --------------------------------------------------- |
-| `ffmpeg_codec`  | `h264_nvenc` | Video codec (`h264_nvenc`, `hevc_nvenc`, `libx264`) |
+| `ffmpeg_codec`  | `hevc_nvenc` | Fixed — 10-bit HEVC on NVENC (libx265 10-bit fallback) |
 | `ffmpeg_preset` | `p7`         | NVENC quality preset (p1=fastest, p7=best)          |
-| `ffmpeg_cq`     | `16`         | Constant quality level (lower=better)               |
+| `ffmpeg_cq`     | `16`         | Constant QP level (lower=better)                    |
+
+**Frame-perfect cutting.** Clips never start on a keyframe-rounded boundary — cuts
+land on exactly the frame the detector chose. Timestamps are regenerated as strict
+CFR (`setpts=N/FRAME_RATE/TB` plus `-fps_mode cfr`) at the source's exact *rational*
+frame rate, so fractional rates such as 24000/1001 do not drift and no frame is
+dropped or duplicated. Every clip's frame count is verified after encoding and any
+mismatch is logged.
+
+Two cutting strategies are used, both frame-exact:
+
+| Mode | When | Cost per clip |
+| ---- | ---- | ------------- |
+| **Keyframe pre-seek** | Constant frame rate sources (the normal case) | Flat — decodes one GOP |
+| **Full decode** | Variable frame rate, or no reliable frame rate | Grows with the clip's position in the source |
+
+CFR is established by reading the actual packet timestamps and confirming every
+frame sits within half a frame of the ideal grid (a container-index scan, no
+decoding — about 3 s on a 150k-frame source). Comparing `r_frame_rate` against
+`avg_frame_rate` is *not* sufficient: containers routinely report both as a clean
+value like `30/1` for material whose real timestamps are irregular, and acting on
+that false positive makes timestamp-based trimming select the wrong frames.
+
+Pre-seek mode fast-seeks to a keyframe before the scene, then selects frames by
+their *original* timestamps under `-copyts`. Because input seeking always lands on
+a keyframe at or before the target, trimming on absolute PTS yields exactly the same
+frames as a full decode — verified bit-identical via `framemd5` — while decoding only
+one GOP instead of the whole file from frame 0. This matters enormously on sources
+with many cuts: full-decode cost per clip scales with how far into the file the clip
+sits (measured on a 10-minute source: 316 ms at 10 s in, 2532 ms at 590 s in),
+whereas pre-seek stays flat at ~480 ms anywhere in the file. On a feature-length
+source with a few thousand cuts that is the difference between hours and minutes.
+
+If a pre-seek clip ever comes out the wrong length, that scene is automatically
+rebuilt with full-decode frame indexing, so exactness never depends on the seek.
+
+Measured on a 1080p30 source cut into 59 scenes (32-core machine), all three
+configurations producing bit-identical clips:
+
+| Pipeline | Wall | CPU busy |
+| -------- | ---- | -------- |
+| Pre-seek + NVDEC (current) | 10.9 s | 6.6 s — 0.6 cores |
+| Pre-seek + CPU decode | 11.6 s | 8.4 s — 0.7 cores |
+| Full decode per scene (previous behaviour) | 28.7 s | **229 s — 8.0 cores** |
+
+The old full-decode-per-scene approach is what saturated CPUs during splitting; it
+re-decoded the source from frame 0 for every single clip.
 
 ---
 
@@ -175,7 +233,7 @@ by argmax over its shot queries rather than by thresholding a score, so it shows
 | **HTML**        | `.html`   | Visual report with scene table              |
 | **SC File**     | `.sc`     | DaVinci Resolve scene cut format            |
 | **Images**      | `.jpg`    | Thumbnail frames per scene                  |
-| **Video Clips** | `.mp4`    | Split video per scene (via FFmpeg)          |
+| **Video Clips** | `.mp4`    | Frame-exact 10-bit HEVC clip per scene (NVENC) |
 
 ---
 
@@ -190,7 +248,7 @@ All three are deep learning models trained for shot boundary detection. Use the 
 
 OmniShotCut is vendored in `OmniShotCut/` rather than pip-installed, because the upstream
 `requirements.txt` pins `transformers==4.57.3`, which would downgrade the version the
-DINOv3/TIPSv2 validation depends on. The vendored copy carries three marked local edits:
+DINOv3 validation depends on. The vendored copy carries three marked local edits:
 the ResNet backbone is built with `pretrained=False` (the checkpoint overwrites every
 backbone weight anyway, so the download is wasted and breaks offline loading), and the
 two hardcoded `.to("cuda")` calls are replaced so the `device` selector works.
@@ -200,13 +258,13 @@ instead of calling `model.inference()`, which would hold the whole video in RAM
 (~36 KB/frame, so roughly 4 GB per hour of 30fps footage) with no progress or abort.
 Output is bit-identical to the upstream path.
 
-### DINOv3 / TIPSv2 AI Validation
+### DINOv3 AI Validation
 
-The optional validation step uses a vision transformer (such as DINOv3 or TIPSv2) to:
+The optional validation step uses DINOv3 to:
 
 - Sample frames before and after each detected cut
-- Compute visual embeddings and similarity scores
-- Filter out false positives (flashes, fast motion, near-black frames)
+- Compute CLS and dense patch embeddings, plus temporal novelty at the boundary
+- Filter out false positives (flashes, fast motion, near-black frames) with optional SSCD
 - Use adaptive thresholding for per-video optimization
 
 ---
@@ -236,5 +294,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [AutoShot](https://github.com/wentaozhu/AutoShot) — Shot boundary detection model
 - [OmniShotCut](https://github.com/UVA-Computer-Vision-Lab/OmniShotCut) — Shot-Query Transformer for shot boundary and transition detection (MIT, vendored in `OmniShotCut/`)
 - [DINOv3](https://github.com/facebookresearch/dinov3) — Vision transformer for validation
-- [TIPSv2](https://github.com/google-deepmind/tips) — Vision language multimodal foundation model
 - [FFmpeg](https://ffmpeg.org/) — Video processing backend
