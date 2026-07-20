@@ -88,7 +88,7 @@ pip install opencv_contrib_python-4.13.0.90-cp37-abi3-win_amd64.whl
 | -------------------------------- | ------------------------------------------- |
 | `ckpt_0_200_0.pth`               | AutoShot model weights                      |
 | `transnetv2-pytorch-weights.pth` | TransNetV2 model weights                    |
-| `OmniShotCut_ckpt.pth`           | OmniShotCut model weights ([HuggingFace](https://huggingface.co/uva-cv-lab/OmniShotCut), ~164 MB) |
+| `OmniShotCut_ckpt.pth`           | OmniShotCut model weights                   |
 | `DINOv3/*`                       | DINOv3 model (for AI validation)            |
 | `TIPSv2/*`                       | TIPSv2 model (for AI validation)            |
 | `sscd_disc_large.torchscript.pt` | SSCD model (for AI validation)              |
