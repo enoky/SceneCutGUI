@@ -26,6 +26,10 @@ TOOLTIPS: dict[str, str] = {
     "luma_only": "If checked, compares frames by brightness only, ignoring color. Faster but may be less accurate.",
     "kernel_size": "Applies a blur to reduce noise before comparing frames. Use 0 for automatic (recommended).",
     
+    # OmniShotCut parameters
+    "omnishot_mode": "clean_shot: keep only hard cuts (transitions like dissolves/fades are absorbed into the previous scene). default: keep every detected shot, including transitions as their own segments.",
+    "omnishot_overlap": "Frames shared between consecutive inference windows. Higher values cost more time but reduce missed cuts at window edges. Default: 20.",
+
     # AdaptiveDetector parameters
     "adaptive_threshold": "Sensitivity for the adaptive detector. Higher values require bigger changes to trigger a cut, finding fewer scenes.",
     "window_width": "Number of surrounding frames to check when adapting the threshold. Helps handle high-motion scenes.",

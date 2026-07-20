@@ -94,6 +94,26 @@ except Exception as e:
     )
 
 # ------------------------------------------------------------------ #
+# OmniShotCut dependency
+# ------------------------------------------------------------------ #
+OMNISHOT_IMPORT_ERROR = None
+omnishotcut = None
+try:
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    OMNI_SHOT_DIR = Path(__file__).resolve().parent / "OmniShotCut"
+    if OMNI_SHOT_DIR.exists():
+        sys.path.insert(0, str(OMNI_SHOT_DIR))
+    import omnishotcut  # noqa: F401
+except Exception as e:
+    OMNISHOT_IMPORT_ERROR = e
+    logger.error(
+        "Failed to import OmniShotCut. Ensure the OmniShotCut folder is present and "
+        "'ffmpeg-python' / 'huggingface_hub' are installed: %s",
+        e,
+    )
+
+# ------------------------------------------------------------------ #
 # Minimal timecode abstraction (minimal timecode abstraction for this GUI)
 # ------------------------------------------------------------------ #
 @dataclass(frozen=True)
@@ -183,6 +203,127 @@ def get_video_info(video_path: str) -> tuple[float, int]:
         pass
 
     raise RuntimeError("Could not determine FPS / frame count for the selected video.")
+
+
+# ------------------------------------------------------------------ #
+# Detector registry
+# ------------------------------------------------------------------ #
+# Each detector declares the parameters it exposes, its default weights file and
+# how to report unavailability. The GUI builds its combobox, its parameter
+# widgets and its settings round-trip from this table, so adding a detector
+# means adding an entry here plus a branch in _detection_and_output_task.
+
+
+def _validate_threshold(value: float) -> None:
+    if not (0.0 < value < 1.0):
+        raise ValueError("threshold must be between 0 and 1.")
+
+
+def _cast_min_scene_len(text: str) -> int:
+    return max(1, int(float(text)))
+
+
+def _cast_overlap(text: str) -> int:
+    value = int(float(text))
+    if value < 0:
+        raise ValueError("overlap must be 0 or greater.")
+    return value
+
+
+@dataclass(frozen=True)
+class DetectorParam:
+    """One parameter widget on the detector panel."""
+    key: str
+    label: str
+    default: str
+    tooltip: str
+    values: Tuple[str, ...] = ()          # non-empty -> readonly combobox
+    cast: Callable[[str], object] = str
+    validate: Optional[Callable[[object], None]] = None
+
+
+@dataclass(frozen=True)
+class DetectorSpec:
+    name: str
+    weights_path: str
+    params: Tuple[DetectorParam, ...]
+    unavailable_reason: Callable[[], Optional[str]]
+
+
+_DEVICE_PARAM = DetectorParam(
+    key="device", label="device:", default="auto", tooltip="device",
+    values=("auto", "cpu", "cuda", "mps"),
+)
+_MIN_SCENE_LEN_PARAM = DetectorParam(
+    key="min_scene_len", label="min_scene_len (frames):", default="12",
+    tooltip="min_scene_len", cast=_cast_min_scene_len,
+)
+
+
+def _threshold_param(default: str) -> DetectorParam:
+    return DetectorParam(
+        key="threshold", label="threshold:", default=default, tooltip="threshold",
+        cast=float, validate=_validate_threshold,
+    )
+
+
+def _autoshot_unavailable() -> Optional[str]:
+    if AutoShotNet is not None:
+        return None
+    detail = f"\n\nImport error: {AUTO_SHOT_IMPORT_ERROR}" if AUTO_SHOT_IMPORT_ERROR else ""
+    return "AutoShot is not available. Ensure the AutoShot repo exists and install 'einops'." + detail
+
+
+def _transnetv2_unavailable() -> Optional[str]:
+    if TransNetV2 is not None:
+        return None
+    detail = f"\n\nImport error: {TRANSNET_IMPORT_ERROR}" if TRANSNET_IMPORT_ERROR else ""
+    return "TransNetV2 is not available. Ensure 'transnetv2-pytorch' is installed." + detail
+
+
+def _omnishotcut_unavailable() -> Optional[str]:
+    if omnishotcut is not None:
+        return None
+    detail = f"\n\nImport error: {OMNISHOT_IMPORT_ERROR}" if OMNISHOT_IMPORT_ERROR else ""
+    return (
+        "OmniShotCut is not available. Ensure the OmniShotCut folder is present and "
+        "'ffmpeg-python' / 'huggingface_hub' are installed." + detail
+    )
+
+
+DETECTORS: dict[str, DetectorSpec] = {
+    "AutoShot": DetectorSpec(
+        name="AutoShot",
+        weights_path="./weights/ckpt_0_200_0.pth",
+        params=(_DEVICE_PARAM, _threshold_param("0.24"), _MIN_SCENE_LEN_PARAM),
+        unavailable_reason=_autoshot_unavailable,
+    ),
+    "TransNetV2": DetectorSpec(
+        name="TransNetV2",
+        weights_path="./weights/transnetv2-pytorch-weights.pth",
+        params=(_DEVICE_PARAM, _threshold_param("0.3"), _MIN_SCENE_LEN_PARAM),
+        unavailable_reason=_transnetv2_unavailable,
+    ),
+    # OmniShotCut picks boundaries by argmax over its shot queries, so it has no
+    # threshold; it exposes the window overlap and the label-filtering mode instead.
+    "OmniShotCut": DetectorSpec(
+        name="OmniShotCut",
+        weights_path="./weights/OmniShotCut_ckpt.pth",
+        params=(
+            _DEVICE_PARAM,
+            DetectorParam(
+                key="mode", label="mode:", default="clean_shot", tooltip="omnishot_mode",
+                values=("clean_shot", "default"),
+            ),
+            DetectorParam(
+                key="overlap", label="overlap (frames):", default="20",
+                tooltip="omnishot_overlap", cast=_cast_overlap,
+            ),
+            _MIN_SCENE_LEN_PARAM,
+        ),
+        unavailable_reason=_omnishotcut_unavailable,
+    ),
+}
 
 
 def short_scene_guard_frames(fps: float, guard_seconds: float = 0.30) -> int:
@@ -506,6 +647,111 @@ def _autoshot_predict_from_stream(frame_gen, model, device, total_frames_est=Non
     final_preds = np.concatenate(predictions, 0)
     return final_preds[:real_frames_count], real_frames_count
 
+def _omnishot_decode_to_memmap(video_path: str, width: int, height: int, raw_path: str,
+                               abort_flag=None, progress_cb=None, total_frames_est=None):
+    """Decode a video to a raw rgb24 temp file and return it as a memmap (T,H,W,3).
+
+    OmniShotCut's own _decode_video() materialises the whole video in RAM at the
+    model's process resolution (~36 KB/frame, so ~4 GB for an hour). Writing to
+    disk and memory-mapping keeps peak RAM flat, lets the OS page in only the
+    window under inference, and gives us somewhere to check the abort flag.
+    """
+    import numpy as np
+
+    frame_bytes = width * height * 3
+    frames_written = 0
+
+    with open(raw_path, "wb") as raw:
+        for chunk in _autoshot_frame_generator(video_path, width=width, height=height):
+            if abort_flag is not None and abort_flag.is_set():
+                raise InterruptedError
+            raw.write(np.ascontiguousarray(chunk).tobytes())
+            frames_written += len(chunk)
+            if progress_cb and total_frames_est:
+                progress_cb(min(1.0, frames_written / total_frames_est),
+                            f"Decoding for OmniShotCut ({frames_written} frames)")
+
+    if frames_written == 0:
+        raise RuntimeError("OmniShotCut received no frames.")
+
+    video_np = np.memmap(raw_path, dtype=np.uint8, mode="r",
+                         shape=(frames_written, height, width, 3))
+    return video_np, frames_written
+
+
+def _omnishot_predict_windows(video_np, model, model_args, overlap: int,
+                              abort_flag=None, progress_cb=None):
+    """Run OmniShotCut window-by-window, returning (ranges, intra_labels, inter_labels).
+
+    This mirrors omnishotcut.engine._run_on_numpy but reuses that module's own
+    split_videos()/merge_predictions() so the windows and valid regions are
+    identical by construction, while adding per-window abort and progress.
+    """
+    from omnishotcut.engine import video_transform, split_videos, merge_predictions
+
+    window = int(model_args.max_process_window_length)
+    if not (0 <= overlap < window):
+        raise ValueError(f"overlap must be between 0 and {window - 1} (model window length).")
+
+    device = next(model.parameters()).device
+    windows = split_videos(video_np, window, overlap)
+    pred_boundary_full: list = []
+
+    for idx, (chunk, _num_pad, window_start, valid_start, valid_end, valid_len) in enumerate(windows):
+        if abort_flag is not None and abort_flag.is_set():
+            raise InterruptedError
+
+        # np.asarray materialises just this window from the memmap.
+        import numpy as np
+        video_tensor = video_transform(np.asarray(chunk)).unsqueeze(0).to(device)
+
+        with torch.inference_mode():
+            outputs = model(video_tensor)
+
+        query_intra_idx = outputs["intra_clip_logits"].softmax(-1)[0, :, :-1].argmax(dim=-1)
+        query_inter_idx = outputs["inter_clip_logits"].softmax(-1)[0, :, :-1].argmax(dim=-1)
+        query_range_idx = outputs["pred_shot_logits"].softmax(-1)[0, :, :-1].argmax(dim=-1)
+
+        pred_boundary = []
+        start_local = 0
+        for keep_idx in range(len(query_intra_idx)):
+            end_local = min(int(query_range_idx[keep_idx].detach().cpu()), valid_len)
+            if start_local >= end_local:
+                continue
+
+            end_global = window_start + end_local
+            if valid_start < end_global <= valid_end:
+                pred_boundary.append({
+                    "end_frame_idx": int(end_global),
+                    "intra_label": int(query_intra_idx[keep_idx].detach().cpu()),
+                    "inter_label": int(query_inter_idx[keep_idx].detach().cpu()),
+                })
+
+            start_local = end_local
+            if end_local >= valid_len:
+                break
+
+        pred_boundary_full = merge_predictions(pred_boundary_full, pred_boundary)
+
+        if progress_cb:
+            progress_cb((idx + 1) / len(windows),
+                        f"OmniShotCut inference (window {idx + 1}/{len(windows)})")
+
+    # Boundaries -> contiguous ranges, identical to upstream's final pass.
+    ranges, intra_labels, inter_labels = [], [], []
+    start_frame_idx = 0
+    for item in pred_boundary_full:
+        end_frame_idx = min(int(item["end_frame_idx"]), len(video_np))
+        if end_frame_idx <= start_frame_idx:
+            continue
+        ranges.append([int(start_frame_idx), int(end_frame_idx)])
+        intra_labels.append(int(item["intra_label"]))
+        inter_labels.append(int(item["inter_label"]))
+        start_frame_idx = end_frame_idx
+
+    return ranges, intra_labels, inter_labels
+
+
 class SceneDetectApp:
     """Main application class encapsulating the GUI and logic."""
 
@@ -530,8 +776,7 @@ class SceneDetectApp:
         self.detector_type_var = tk.StringVar(value="TransNetV2")
         self.params_vars: dict = {}
         self.detector_params_cache: dict[str, dict[str, str]] = {
-            "AutoShot": self._default_detector_params("AutoShot"),
-            "TransNetV2": self._default_detector_params("TransNetV2"),
+            name: self._default_detector_params(name) for name in DETECTORS
         }
         self._last_detector_type = self.detector_type_var.get()
         self.snap_cuts_var = tk.BooleanVar(value=True)
@@ -610,7 +855,7 @@ class SceneDetectApp:
         detector_combo = ttk.Combobox(
             detector_row,
             textvariable=self.detector_type_var,
-            values=["AutoShot", "TransNetV2"],
+            values=list(DETECTORS),
             state="readonly",
             width=14,
         )
@@ -738,6 +983,21 @@ class SceneDetectApp:
             
             self.loaded_models[key] = model
             return model
+        elif detector_type == "OmniShotCut":
+            if omnishotcut is None:
+                raise RuntimeError(f"OmniShotCut is unavailable: {OMNISHOT_IMPORT_ERROR}")
+            if not weights_path or not os.path.exists(weights_path):
+                raise FileNotFoundError(
+                    f"OmniShotCut weights file not found: {weights_path}\n\n"
+                    "Download 'OmniShotCut_ckpt.pth' from https://huggingface.co/uva-cv-lab/OmniShotCut "
+                    "into the weights/ directory."
+                )
+
+            resolved_device = _autoshot_select_device(device)
+            model = omnishotcut.load(weights_path, device=resolved_device)
+
+            self.loaded_models[key] = model
+            return model
         else:
             raise ValueError(f"Unknown detector: {detector_type}")
 
@@ -748,12 +1008,10 @@ class SceneDetectApp:
         self.root.destroy()
 
     def _default_detector_params(self, detector_type: str) -> dict[str, str]:
-        threshold = "0.24" if detector_type == "AutoShot" else "0.3"
-        return {
-            "device": "auto",
-            "threshold": threshold,
-            "min_scene_len": "12",
-        }
+        spec = DETECTORS.get(detector_type)
+        if spec is None:
+            return {}
+        return {p.key: p.default for p in spec.params}
 
     def _cache_detector_params(self, detector_type: str | None) -> None:
         if not detector_type or not self.params_vars:
@@ -822,13 +1080,13 @@ class SceneDetectApp:
             
             # Detector type & per-detector params
             detector_type = settings.get("detector_type", "AutoShot")
-            if detector_type not in {"AutoShot", "TransNetV2"}:
+            if detector_type not in DETECTORS:
                 detector_type = "AutoShot"
 
             loaded_params = settings.get("detector_params")
             if isinstance(loaded_params, dict):
-                if any(k in loaded_params for k in ("AutoShot", "TransNetV2")):
-                    for det in ("AutoShot", "TransNetV2"):
+                if any(k in loaded_params for k in DETECTORS):
+                    for det in DETECTORS:
                         det_params = loaded_params.get(det)
                         if isinstance(det_params, dict):
                             self.detector_params_cache[det].update(det_params)
@@ -863,7 +1121,7 @@ class SceneDetectApp:
         return
 
     def _build_detector_params(self):
-        """Build detector parameter widgets."""
+        """Build detector parameter widgets from the selected detector's schema."""
         for widget in self.params_frame.winfo_children():
             widget.destroy()
 
@@ -871,34 +1129,27 @@ class SceneDetectApp:
         self.params_vars.clear()
 
         detector_type = self.detector_type_var.get()
+        spec = DETECTORS.get(detector_type)
+        if spec is None:
+            self._last_detector_type = detector_type
+            return
+
         params = self.detector_params_cache.get(detector_type, self._default_detector_params(detector_type))
-        default_threshold = "0.296" if detector_type == "AutoShot" else "0.3"
 
-        # Row 0: device
-        ttk.Label(self.params_frame, text="device:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
-        d_var = tk.StringVar(value=str(params.get("device", "auto")))
-        d_combo = ttk.Combobox(self.params_frame, textvariable=d_var, values=["auto", "cpu", "cuda", "mps"], state="readonly", width=10)
-        d_combo.grid(row=0, column=1, padx=5, pady=2, sticky="w")
-        self._attach_tooltip(d_combo, "device")
+        for row, param in enumerate(spec.params):
+            ttk.Label(self.params_frame, text=param.label).grid(row=row, column=0, padx=5, pady=2, sticky="w")
+            var = tk.StringVar(value=str(params.get(param.key, param.default)))
+            if param.values:
+                widget = ttk.Combobox(
+                    self.params_frame, textvariable=var,
+                    values=list(param.values), state="readonly", width=10,
+                )
+            else:
+                widget = ttk.Entry(self.params_frame, textvariable=var, width=10)
+            widget.grid(row=row, column=1, padx=5, pady=2, sticky="w")
+            self._attach_tooltip(widget, param.tooltip)
+            self.params_vars[param.key] = var
 
-        # Row 1: threshold
-        ttk.Label(self.params_frame, text="threshold:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
-        t_var = tk.StringVar(value=str(params.get("threshold", default_threshold)))
-        t_entry = ttk.Entry(self.params_frame, textvariable=t_var, width=10)
-        t_entry.grid(row=1, column=1, padx=5, pady=2, sticky="w")
-        self._attach_tooltip(t_entry, "threshold")
-
-        # Row 2: min_scene_len
-        ttk.Label(self.params_frame, text="min_scene_len (frames):").grid(row=2, column=0, padx=5, pady=2, sticky="w")
-        m_var = tk.StringVar(value=str(params.get("min_scene_len", "8")))
-        m_entry = ttk.Entry(self.params_frame, textvariable=m_var, width=10)
-        m_entry.grid(row=2, column=1, padx=5, pady=2, sticky="w")
-        self._attach_tooltip(m_entry, "min_scene_len")
-
-        # Save vars
-        self.params_vars["device"] = d_var
-        self.params_vars["threshold"] = t_var
-        self.params_vars["min_scene_len"] = m_var
         self._last_detector_type = detector_type
 
 
@@ -909,51 +1160,33 @@ class SceneDetectApp:
             messagebox.showerror("Error", "Please select a video file and an output folder.")
             return
         detector_type = self.detector_type_var.get()
-        if detector_type == "AutoShot":
-            if AutoShotNet is None:
-                detail = f"\n\nImport error: {AUTO_SHOT_IMPORT_ERROR}" if AUTO_SHOT_IMPORT_ERROR else ""
-                messagebox.showerror(
-                    "Error",
-                    "AutoShot is not available. Ensure the AutoShot repo exists and install 'einops'."
-                    + detail,
-                )
-                return
-            default_weights = "./weights/ckpt_0_200_0.pth"
-        elif detector_type == "TransNetV2":
-            if TransNetV2 is None:
-                detail = f"\n\nImport error: {TRANSNET_IMPORT_ERROR}" if TRANSNET_IMPORT_ERROR else ""
-                messagebox.showerror(
-                    "Error",
-                    "TransNetV2 is not available. Ensure 'transnetv2-pytorch' is installed."
-                    + detail,
-                )
-                return
-            default_weights = "./weights/transnetv2-pytorch-weights.pth"
-        else:
+        spec = DETECTORS.get(detector_type)
+        if spec is None:
             messagebox.showerror("Error", f"Unknown detector type: {detector_type}")
             return
 
+        if reason := spec.unavailable_reason():
+            messagebox.showerror("Error", reason)
+            return
+
+        detector_cfg: dict = {
+            "type": detector_type,
+            "weights_path": spec.weights_path,
+        }
         try:
-            weights_path = default_weights
-            device = str(self.params_vars.get("device").get()).strip() or "auto"
-            threshold = float(self.params_vars.get("threshold").get())
-            min_scene_len = int(float(self.params_vars.get("min_scene_len").get()))
-            if not (0.0 < threshold < 1.0):
-                raise ValueError("threshold must be between 0 and 1.")
-            if min_scene_len < 1:
-                min_scene_len = 1
+            for param in spec.params:
+                var = self.params_vars.get(param.key)
+                raw = str(var.get()).strip() if var is not None else param.default
+                if not raw:
+                    raw = param.default
+                value = param.cast(raw)
+                if param.validate is not None:
+                    param.validate(value)
+                detector_cfg[param.key] = value
         except Exception as exc:
             logger.error("Invalid %s parameters: %s", detector_type, exc)
             messagebox.showerror("Parameter Error", f"Invalid {detector_type} parameters: {exc}")
             return
-
-        detector_cfg = {
-            "type": detector_type,
-            "weights_path": weights_path,
-            "device": device,
-            "threshold": threshold,
-            "min_scene_len": min_scene_len,
-        }
 
         self.progress_var.set(0)
         self.progress_label.config(text="Starting...")
@@ -1054,6 +1287,100 @@ class SceneDetectApp:
 
                 self.progress_queue.put((60, f"TransNetV2 returned {len(tn_scenes)} scenes. Converting..."))
                 scenes = transnetv2_scenes_to_timecodes(tn_scenes, fps=fps, total_frames=total_frames)
+
+            elif detector_type == "OmniShotCut":
+                self.progress_queue.put((10, "Checking OmniShotCut model..."))
+
+                weights_path = str(detector.get("weights_path", "")).strip()
+                if not weights_path:
+                    raise FileNotFoundError("OmniShotCut weights_path is empty.")
+
+                model = self._get_or_load_model("OmniShotCut", weights_path, detector.get("device", "auto"))
+
+                if self.abort_flag.is_set():
+                    raise InterruptedError
+
+                model_args = model._model_args
+                proc_w = int(model_args.process_width)
+                proc_h = int(model_args.process_height)
+                mode = str(detector.get("mode", "clean_shot"))
+                overlap = int(detector.get("overlap", 20))
+
+                # Decode to a raw temp file and memory-map it, rather than using
+                # model.inference(), which buffers the whole video in RAM and
+                # offers no progress or abort hook.
+                import tempfile
+                from collections import Counter
+                from omnishotcut.label_correspondence import (
+                    unique_intra_label_mapping, intra_int2string, inter_int2string,
+                )
+
+                raw_fd, raw_path = tempfile.mkstemp(suffix=".rgb24", prefix="omnishotcut_")
+                os.close(raw_fd)
+                video_np = None
+                try:
+                    self.progress_queue.put((20, "Decoding video for OmniShotCut..."))
+                    video_np, decoded_frames = _omnishot_decode_to_memmap(
+                        video_path, proc_w, proc_h, raw_path,
+                        abort_flag=self.abort_flag,
+                        progress_cb=lambda pct, msg: self.progress_queue.put((20 + pct * 15.0, msg)),
+                        total_frames_est=total_frames if total_frames > 0 else None,
+                    )
+
+                    if total_frames <= 0:
+                        total_frames = decoded_frames
+                        self.total_frames = total_frames
+                    elif abs(total_frames - decoded_frames) > 1:
+                        logger.warning(
+                            "Frame count mismatch: ffprobe=%d, decoded=%d. Using ffprobe count for outputs.",
+                            total_frames, decoded_frames,
+                        )
+
+                    self.progress_queue.put((35, f"Running OmniShotCut inference (mode={mode})..."))
+                    ranges, intra_ids, inter_ids = _omnishot_predict_windows(
+                        video_np, model._model, model_args, overlap,
+                        abort_flag=self.abort_flag,
+                        progress_cb=lambda pct, msg: self.progress_queue.put((35 + pct * 25.0, msg)),
+                    )
+                finally:
+                    # Windows refuses to delete a file while it is still mapped.
+                    if video_np is not None and hasattr(video_np, "_mmap"):
+                        video_np._mmap.close()
+                    video_np = None
+                    try:
+                        os.remove(raw_path)
+                    except OSError as exc:
+                        logger.warning("Could not remove OmniShotCut temp file %s: %s", raw_path, exc)
+
+                if mode == "clean_shot":
+                    # Keep only general (hard) cuts; dropped transitions leave gaps
+                    # that the conversion below closes.
+                    general_id = unique_intra_label_mapping["general"]
+                    ranges = [r for r, lbl in zip(ranges, intra_ids) if lbl == general_id]
+                else:
+                    logger.info(
+                        "OmniShotCut transition labels: %s",
+                        dict(Counter(intra_int2string.get(x, str(x)) for x in intra_ids)),
+                    )
+                    logger.debug(
+                        "OmniShotCut inter labels: %s",
+                        dict(Counter(inter_int2string.get(x, str(x)) for x in inter_ids)),
+                    )
+
+                if self.abort_flag.is_set():
+                    raise InterruptedError
+
+                self.progress_queue.put((60, f"OmniShotCut returned {len(ranges)} ranges. Converting..."))
+
+                # Ranges are [start, end) with end exclusive; in "default" mode they
+                # already tile the video, while "clean_shot" leaves gaps where the
+                # dropped transitions were. transnetv2_scenes_to_timecodes closes
+                # those gaps by extending the preceding scene.
+                osc_scenes = [
+                    {"start_frame": int(start), "end_frame": int(end)}
+                    for start, end in ranges
+                ]
+                scenes = transnetv2_scenes_to_timecodes(osc_scenes, fps=fps, total_frames=total_frames)
 
             else:
                 raise RuntimeError(f"Unknown detector type: {detector_type}")

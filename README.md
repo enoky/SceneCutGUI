@@ -1,6 +1,6 @@
 # SceneCutGUI
 
-A modern, GPU-accelerated scene detection and video slicing tool with an intuitive Tkinter GUI. Uses **AutoShot** or **TransNetV2** neural networks for highly accurate shot boundary detection, with optional **DINOv3/TIPSv2-based AI validation** to filter false positives.
+A modern, GPU-accelerated scene detection and video slicing tool with an intuitive Tkinter GUI. Uses **AutoShot**, **TransNetV2** or **OmniShotCut** neural networks for highly accurate shot boundary detection, with optional **DINOv3/TIPSv2-based AI validation** to filter false positives.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -10,7 +10,7 @@ A modern, GPU-accelerated scene detection and video slicing tool with an intuiti
 
 ## ✨ Features
 
-- **AutoShot / TransNetV2 Detection** — State-of-the-art neural networks for shot boundary detection
+- **AutoShot / TransNetV2 / OmniShotCut Detection** — State-of-the-art neural networks for shot boundary detection, including transition-aware detection (dissolves, wipes, fades) via OmniShotCut
 - **DINOv3/TIPSv2/SSCD AI Validation** — Optional post-processing to filter out flashes, fast motion, and near-black false positives
 - **GPU Acceleration** — CUDA support for both video decoding (OpenCV) and model inference (PyTorch)
 - **Multiple Export Formats**:
@@ -88,6 +88,7 @@ pip install opencv_contrib_python-4.13.0.90-cp37-abi3-win_amd64.whl
 | -------------------------------- | ------------------------------------------- |
 | `ckpt_0_200_0.pth`               | AutoShot model weights                      |
 | `transnetv2-pytorch-weights.pth` | TransNetV2 model weights                    |
+| `OmniShotCut_ckpt.pth`           | OmniShotCut model weights ([HuggingFace](https://huggingface.co/uva-cv-lab/OmniShotCut), ~164 MB) |
 | `DINOv3/*`                       | DINOv3 model (for AI validation)            |
 | `TIPSv2/*`                       | TIPSv2 model (for AI validation)            |
 | `sscd_disc_large.torchscript.pt` | SSCD model (for AI validation)              |
@@ -131,6 +132,15 @@ RUN_SceneCutGUI.bat
 | `threshold`     | `0.296` (AutoShot) / `0.3` (TransNetV2) | Cut detection sensitivity (0–1)               |
 | `min_scene_len` | `8`                                     | Minimum scene length in frames                |
 
+The parameter panel changes with the selected detector. OmniShotCut picks boundaries
+by argmax over its shot queries rather than by thresholding a score, so it shows no
+`threshold` field and offers these instead:
+
+| Parameter | Default      | Description                                                                                                    |
+| --------- | ------------ | -------------------------------------------------------------------------------------------------------------- |
+| `mode`    | `clean_shot` | `clean_shot` keeps only hard cuts (dissolves/fades are absorbed into the preceding scene); `default` keeps every detected shot, with transitions as their own segments |
+| `overlap` | `20`         | Frames shared between consecutive inference windows (model window is 100 frames)                                |
+
 ### AI Validation (Optional)
 
 | Parameter           | Default  | Description                                    |
@@ -171,9 +181,24 @@ RUN_SceneCutGUI.bat
 
 ## 🧠 How It Works
 
-### AutoShot and TransNetV2 Detection
+### AutoShot, TransNetV2 and OmniShotCut Detection
 
-AutoShot and TransNetV2 are deep learning models trained for shot boundary detection. Use the detector selector in the GUI to switch between them based on your content and performance needs.
+All three are deep learning models trained for shot boundary detection. Use the detector selector in the GUI to switch between them based on your content and performance needs.
+
+- **AutoShot / TransNetV2** score every frame for how likely it is to be a cut, and the `threshold` controls sensitivity.
+- **OmniShotCut** is a Shot-Query Transformer that predicts shot *ranges* directly and classifies each one (General, Dissolve, Wipes, Push, Slide, Zoom, Fade, Doorway). Because boundaries come from an argmax over queries, there is no threshold to tune — use `mode` to decide whether transitions become their own segments. It is trained on diverse footage (anime, vlogs, gaming, sports, screen recordings), so it is a good first choice for stylised content where the other two over- or under-segment.
+
+OmniShotCut is vendored in `OmniShotCut/` rather than pip-installed, because the upstream
+`requirements.txt` pins `transformers==4.57.3`, which would downgrade the version the
+DINOv3/TIPSv2 validation depends on. The vendored copy carries three marked local edits:
+the ResNet backbone is built with `pretrained=False` (the checkpoint overwrites every
+backbone weight anyway, so the download is wasted and breaks offline loading), and the
+two hardcoded `.to("cuda")` calls are replaced so the `device` selector works.
+
+The GUI decodes to a memory-mapped temp file and drives inference window-by-window
+instead of calling `model.inference()`, which would hold the whole video in RAM
+(~36 KB/frame, so roughly 4 GB per hour of 30fps footage) with no progress or abort.
+Output is bit-identical to the upstream path.
 
 ### DINOv3 / TIPSv2 AI Validation
 
@@ -209,6 +234,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [TransNetV2](https://github.com/soCzech/TransNetV2) ? Shot boundary detection model
 - [transnetv2-pytorch](https://pypi.org/project/transnetv2-pytorch/) ? PyTorch implementation
 - [AutoShot](https://github.com/wentaozhu/AutoShot) — Shot boundary detection model
+- [OmniShotCut](https://github.com/UVA-Computer-Vision-Lab/OmniShotCut) — Shot-Query Transformer for shot boundary and transition detection (MIT, vendored in `OmniShotCut/`)
 - [DINOv3](https://github.com/facebookresearch/dinov3) — Vision transformer for validation
 - [TIPSv2](https://github.com/google-deepmind/tips) — Vision language multimodal foundation model
 - [FFmpeg](https://ffmpeg.org/) — Video processing backend

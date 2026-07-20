@@ -9,4 +9,10 @@ transformers
 sentencepiece
 numpy
 
+# OmniShotCut (vendored in OmniShotCut/) — deliberately not installed from its own
+# repo, whose requirements.txt pins transformers==4.57.3 and would downgrade the
+# version the DINOv3/TIPSv2 validation relies on.
+ffmpeg-python
+huggingface_hub
+
 # pip install opencv-contrib-python with CUDA from here: https://github.com/cudawarped/opencv-python-cuda-wheels/releases
