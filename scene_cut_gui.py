@@ -393,6 +393,13 @@ def _cast_overlap(text: str) -> int:
     return value
 
 
+def _validate_confidence(value: float) -> None:
+    # 0.0 keeps every boundary the model proposes (upstream behaviour); 1.0 would
+    # reject all of them, so it is excluded.
+    if not (0.0 <= value < 1.0):
+        raise ValueError("confidence must be between 0 and 1 (0 disables filtering).")
+
+
 @dataclass(frozen=True)
 class DetectorParam:
     """One parameter widget on the detector panel."""
@@ -467,8 +474,10 @@ DETECTORS: dict[str, DetectorSpec] = {
         params=(_DEVICE_PARAM, _threshold_param("0.3"), _MIN_SCENE_LEN_PARAM),
         unavailable_reason=_transnetv2_unavailable,
     ),
-    # OmniShotCut picks boundaries by argmax over its shot queries, so it has no
-    # threshold; it exposes the window overlap and the label-filtering mode instead.
+    # OmniShotCut has no frame-difference threshold like the other detectors: it
+    # localises boundaries with a query head. Its equivalent dial is how sharply
+    # that head pins down the cut's frame, exposed here as "confidence" — see
+    # _omnishot_predict_windows for why that and not the no-object class.
     "OmniShotCut": DetectorSpec(
         name="OmniShotCut",
         weights_path="./weights/OmniShotCut_ckpt.pth",
@@ -477,6 +486,10 @@ DETECTORS: dict[str, DetectorSpec] = {
             DetectorParam(
                 key="mode", label="mode:", default="clean_shot", tooltip="omnishot_mode",
                 values=("clean_shot", "default"),
+            ),
+            DetectorParam(
+                key="confidence", label="min confidence:", default="0.0",
+                tooltip="omnishot_confidence", cast=float, validate=_validate_confidence,
             ),
             DetectorParam(
                 key="overlap", label="overlap (frames):", default="20",
@@ -843,22 +856,42 @@ def _omnishot_decode_to_memmap(video_path: str, width: int, height: int, raw_pat
 
 
 def _omnishot_predict_windows(video_np, model, model_args, overlap: int,
+                              confidence: float = 0.0,
                               abort_flag=None, progress_cb=None):
-    """Run OmniShotCut window-by-window, returning (ranges, intra_labels, inter_labels).
+    """Run OmniShotCut window-by-window.
+
+    Returns (ranges, intra_labels, inter_labels, confidences).
 
     This mirrors omnishotcut.engine._run_on_numpy but reuses that module's own
     split_videos()/merge_predictions() so the windows and valid regions are
-    identical by construction, while adding per-window abort and progress.
+    identical by construction, while adding per-window abort, progress and
+    confidence filtering.
+
+    `confidence` is a minimum per-boundary localisation score in [0, 1), taken as
+    the peak of the range head's softmax over frame positions.
+
+    The intra head does have a trailing no-object column (10 outputs for 9 real
+    labels), but measuring it on the shipped checkpoint shows p(no-object) is
+    ~0 for every query, so it carries no signal. This model rejects a query a
+    different way: idle queries emit range_idx == window_length with intra label
+    "padding", which the degenerate start >= end check below already discards.
+    What remains variable is how sharply the range head localises the boundary it
+    did propose, and that is what we threshold on. 0.0 reproduces upstream
+    behaviour exactly.
     """
     from omnishotcut.engine import video_transform, split_videos, merge_predictions
 
     window = int(model_args.max_process_window_length)
     if not (0 <= overlap < window):
         raise ValueError(f"overlap must be between 0 and {window - 1} (model window length).")
+    if not (0.0 <= confidence < 1.0):
+        raise ValueError("confidence must be between 0 and 1 (0 disables filtering).")
 
     device = next(model.parameters()).device
     windows = split_videos(video_np, window, overlap)
     pred_boundary_full: list = []
+    seen_confidences: list[float] = []
+    num_rejected = 0
 
     for idx, (chunk, _num_pad, window_start, valid_start, valid_end, valid_len) in enumerate(windows):
         if abort_flag is not None and abort_flag.is_set():
@@ -873,7 +906,13 @@ def _omnishot_predict_windows(video_np, model, model_args, overlap: int,
 
         query_intra_idx = outputs["intra_clip_logits"].softmax(-1)[0, :, :-1].argmax(dim=-1)
         query_inter_idx = outputs["inter_clip_logits"].softmax(-1)[0, :, :-1].argmax(dim=-1)
-        query_range_idx = outputs["pred_shot_logits"].softmax(-1)[0, :, :-1].argmax(dim=-1)
+
+        # Peak of the range head doubles as the boundary's confidence: a flat
+        # distribution means the model is unsure where the cut actually falls.
+        range_probs = outputs["pred_shot_logits"].softmax(-1)[0, :, :-1]
+        range_peak = range_probs.max(dim=-1)
+        query_range_idx = range_peak.indices
+        query_conf = range_peak.values.detach().cpu()
 
         pred_boundary = []
         start_local = 0
@@ -884,12 +923,22 @@ def _omnishot_predict_windows(video_np, model, model_args, overlap: int,
 
             end_global = window_start + end_local
             if valid_start < end_global <= valid_end:
-                pred_boundary.append({
-                    "end_frame_idx": int(end_global),
-                    "intra_label": int(query_intra_idx[keep_idx].detach().cpu()),
-                    "inter_label": int(query_inter_idx[keep_idx].detach().cpu()),
-                })
+                conf = float(query_conf[keep_idx])
+                seen_confidences.append(conf)
+                if conf >= confidence:
+                    pred_boundary.append({
+                        "end_frame_idx": int(end_global),
+                        "intra_label": int(query_intra_idx[keep_idx].detach().cpu()),
+                        "inter_label": int(query_inter_idx[keep_idx].detach().cpu()),
+                        "confidence": conf,
+                    })
+                else:
+                    # Dropping the boundary merges this segment into the next one,
+                    # because ranges are rebuilt contiguously from what survives.
+                    num_rejected += 1
 
+            # Advance regardless: start_local chains the queries' local ranges, so
+            # it must track the model's segmentation even where we reject a boundary.
             start_local = end_local
             if end_local >= valid_len:
                 break
@@ -901,7 +950,7 @@ def _omnishot_predict_windows(video_np, model, model_args, overlap: int,
                         f"OmniShotCut inference (window {idx + 1}/{len(windows)})")
 
     # Boundaries -> contiguous ranges, identical to upstream's final pass.
-    ranges, intra_labels, inter_labels = [], [], []
+    ranges, intra_labels, inter_labels, confidences = [], [], [], []
     start_frame_idx = 0
     for item in pred_boundary_full:
         end_frame_idx = min(int(item["end_frame_idx"]), len(video_np))
@@ -910,9 +959,23 @@ def _omnishot_predict_windows(video_np, model, model_args, overlap: int,
         ranges.append([int(start_frame_idx), int(end_frame_idx)])
         intra_labels.append(int(item["intra_label"]))
         inter_labels.append(int(item["inter_label"]))
+        confidences.append(float(item.get("confidence", 1.0)))
         start_frame_idx = end_frame_idx
 
-    return ranges, intra_labels, inter_labels
+    # Log the distribution so the threshold can be calibrated against a real run
+    # instead of guessed at.
+    if seen_confidences:
+        ordered = sorted(seen_confidences)
+        quantiles = {
+            f"p{q}": round(ordered[min(len(ordered) - 1, int(len(ordered) * q / 100))], 4)
+            for q in (5, 25, 50, 75, 95)
+        }
+        logger.info(
+            "OmniShotCut confidence over %d proposed boundaries: %s (rejected %d at confidence>=%.3f)",
+            len(seen_confidences), quantiles, num_rejected, confidence,
+        )
+
+    return ranges, intra_labels, inter_labels, confidences
 
 
 class SceneDetectApp:
@@ -1464,6 +1527,7 @@ class SceneDetectApp:
                 proc_h = int(model_args.process_height)
                 mode = str(detector.get("mode", "clean_shot"))
                 overlap = int(detector.get("overlap", 20))
+                confidence = float(detector.get("confidence", 0.0) or 0.0)
 
                 # Decode to a raw temp file and memory-map it, rather than using
                 # model.inference(), which buffers the whole video in RAM and
@@ -1496,8 +1560,9 @@ class SceneDetectApp:
                         )
 
                     self.progress_queue.put((35, f"Running OmniShotCut inference (mode={mode})..."))
-                    ranges, intra_ids, inter_ids = _omnishot_predict_windows(
+                    ranges, intra_ids, inter_ids, confs = _omnishot_predict_windows(
                         video_np, model._model, model_args, overlap,
+                        confidence=confidence,
                         abort_flag=self.abort_flag,
                         progress_cb=lambda pct, msg: self.progress_queue.put((35 + pct * 25.0, msg)),
                     )
@@ -1524,6 +1589,12 @@ class SceneDetectApp:
                     logger.debug(
                         "OmniShotCut inter labels: %s",
                         dict(Counter(inter_int2string.get(x, str(x)) for x in inter_ids)),
+                    )
+
+                if confs:
+                    logger.debug(
+                        "OmniShotCut kept %d boundaries, confidence min=%.4f mean=%.4f",
+                        len(confs), min(confs), sum(confs) / len(confs),
                     )
 
                 if self.abort_flag.is_set():

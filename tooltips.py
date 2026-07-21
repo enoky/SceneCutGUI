@@ -29,6 +29,7 @@ TOOLTIPS: dict[str, str] = {
     # OmniShotCut parameters
     "omnishot_mode": "clean_shot: keep only hard cuts (transitions like dissolves/fades are absorbed into the previous scene). default: keep every detected shot, including transitions as their own segments.",
     "omnishot_overlap": "Frames shared between consecutive inference windows. Higher values cost more time but reduce missed cuts at window edges. Default: 20.",
+    "omnishot_confidence": "Minimum confidence a cut must have to be kept (0-1), based on how precisely the model can pin down the cut's exact frame. This is OmniShotCut's equivalent of a threshold: higher values keep fewer, more certain cuts, and rejected cuts merge into the following scene. 0 keeps everything (default). It bites quickly - around 0.5 typically drops a third of cuts - so start near 0.3 and raise it slowly. The log lists the confidence spread for your video after each run.",
 
     # AdaptiveDetector parameters
     "adaptive_threshold": "Sensitivity for the adaptive detector. Higher values require bigger changes to trigger a cut, finding fewer scenes.",
